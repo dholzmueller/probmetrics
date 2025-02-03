@@ -1,3 +1,5 @@
+[![test](https://github.com/dholzmueller/probmetrics/actions/workflows/testing.yml/badge.svg)](https://github.com/dholzmueller/probmetrics/actions/workflows/testing.yml)
+
 # Probmetrics: Classification metrics and post-hoc calibration
 
 This package (PyTorch-based) currently contains
