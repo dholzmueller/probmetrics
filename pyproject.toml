@@ -42,6 +42,8 @@ extra = [
     "netcal", # for temperature scaling comparison
     "relplot", # for smooth ECE
     "pytorch-minimize", # for torchcal TS implementation
+    # relplot fails for sklearn 1.7: ModuleNotFoundError: No module named 'sklearn.utils._estimator_html_repr'
+    "scikit-learn>=1.3,<1.7",
 ]
 dev = [
     "matplotlib>=3.0", # plotting
