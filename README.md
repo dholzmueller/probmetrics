@@ -1,4 +1,6 @@
 [![test](https://github.com/dholzmueller/probmetrics/actions/workflows/testing.yml/badge.svg)](https://github.com/dholzmueller/probmetrics/actions/workflows/testing.yml)
+[![Downloads](https://img.shields.io/pypi/dm/probmetrics)](https://pypistats.org/packages/probmetrics)
+
 
 # Probmetrics: Classification metrics and post-hoc calibration
 
@@ -43,18 +45,15 @@ does not suffer from optimization issues.
 from probmetrics.calibrators import get_calibrator
 import numpy as np
 
-probas = np.asarray([[0.1, 0.9]])
-labels = np.asarray([1])
+probas = np.asarray([[0.1, 0.9]])  # shape = (n_samples, n_classes)
+labels = np.asarray([1])  # shape = (n_samples,)
 # this is the version with Laplace smoothing, 
-# use 'temp-scaling' for the version without
+# use calibrate_with_mixture=False (the default) for no Laplace smoothing
 calib = get_calibrator('temp-scaling', calibrate_with_mixture=True)
 # other option: calib = MixtureCalibrator(TemperatureScalingCalibrator())
 # there is also a fit_torch / predict_proba_torch interface
 calib.fit(probas, labels)
 calibrated_probas = calib.predict_proba(probas)
-
-# -------- alternatively, using torch tensors (GPU support) ------------
-
 ```
 
 ### PyTorch interface
@@ -70,6 +69,7 @@ import torch
 probas = torch.as_tensor([[0.1, 0.9]])
 labels = torch.as_tensor([1])
 
+# temp-scaling with Laplace smoothing
 calib = get_calibrator('ts-mix')
 
 # if you have logits, you can use CategoricalLogits instead
@@ -131,3 +131,14 @@ Metrics.get_available_names(metric_type=MetricType.CLASS)
 ```
 
 While there are some classes for regression metrics, they are not implemented.
+
+
+## Releases
+
+- v0.0.2:
+  - Removed numpy<2.0 constraint, 
+  - allow 1D vectors in CategoricalLogits / CategoricalProbs
+  - add TorchCal temperature scaling
+  - minor fixes in AutoGluon temperature scaling 
+    that shouldn't affect the performance in practice
+- v0.0.1: Initial release

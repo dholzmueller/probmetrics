@@ -1,3 +1,4 @@
+import warnings
 from typing import Callable, Optional, List
 
 import numpy as np
@@ -207,6 +208,7 @@ class GuoTemperatureScalingCalibrator(Calibrator):
 class AutoGluonTemperatureScalingCalibrator(Calibrator):
     # adapted from
     # https://github.com/autogluon/autogluon/blob/c1181326cf6b7e3b27a7420273f1a82808d939e2/core/src/autogluon/core/calibrate/temperature_scaling.py#L9
+    # https://github.com/autogluon/autogluon/blob/28a242ebe8d55ba770c991b9db153ab4623c9abd/tabular/src/autogluon/tabular/trainer/abstract_trainer.py#L4433-L4457
     def __init__(self, init_val: float = 1, max_iter: int = 200, lr: float = 0.1):
         super().__init__()
         self.init_val = init_val
@@ -229,6 +231,10 @@ class AutoGluonTemperatureScalingCalibrator(Calibrator):
 
         optimizer_trajectory = []
 
+        if self.init_val != 1.0:
+            # need to check 1.0 as well since AutoGluon does it outside
+            optimizer_trajectory.append((nll_criterion(logits, y_val_tensor).item(), 1.0))
+
         def temperature_scale_step():
             optimizer.zero_grad()
             temp = temperature_param.unsqueeze(1).expand(logits.size(0), logits.size(1))
@@ -244,10 +250,12 @@ class AutoGluonTemperatureScalingCalibrator(Calibrator):
         try:
             best_loss_index = np.nanargmin(np.array(optimizer_trajectory)[:, 0])
         except ValueError:
+            self.temperature = 1.0
             return
         temperature_scale = float(np.array(optimizer_trajectory)[best_loss_index, 1])
 
-        if np.isnan(temperature_scale):
+        if np.isnan(temperature_scale) or temperature_scale <= 0.0:
+            self.temperature = 1.0
             return
 
         self.temperature = temperature_scale
@@ -348,6 +356,36 @@ class NetcalTemperatureScalingCalibrator(Calibrator):
             return np.concatenate([1. - result, result], axis=1)
 
         return result
+
+
+class TorchcalTemperatureScalingCalibrator(Calibrator):
+    # adapted from
+    # https://github.com/rishabh-ranjan/torchcal/blob/3fb65f6423d33d680cd68c7f40a0259d41e8fb0b/torchcal.py#L8
+    def __init__(self):
+        super().__init__()
+        self.temperature = 1.0
+
+    def _fit_torch_impl(self, y_pred: CategoricalDistribution, y_true_labels: torch.Tensor):
+        import torchmin
+        y_pred_logits = y_pred.get_logits()
+
+        temp = torch.ones(1, device=y_pred_logits.device)
+
+        def loss(t):
+            return torch.nn.functional.cross_entropy(y_pred_logits / t, y_true_labels)
+
+        res = torchmin.minimize(loss, temp, method='newton-exact')
+        if not res.success:
+            warnings.warn(
+                f"{self.__class__}: {res.message} Not updating calibrator params."
+            )
+        else:
+            temp = res.x
+
+        self.temperature = temp.item()
+
+    def predict_proba_torch(self, y_pred: CategoricalDistribution) -> CategoricalDistribution:
+        return CategoricalLogits(y_pred.get_logits() / self.temperature)
 
 
 class CenteredIsotonicRegressionCalibrator(Calibrator):
@@ -521,6 +559,11 @@ class IdentityEstimator(ClassifierMixin, BaseEstimator):
     def predict_proba(self, X):
         return X
 
+    def predict(self, X):
+        # having this as a dummy here for the FrozenEstimator solution
+        # which hovewer doesn't work right now
+        raise NotImplementedError()
+
 
 class SklearnCalibrator(Calibrator):
     def __init__(self, method: str, cv: str):
@@ -533,14 +576,11 @@ class SklearnCalibrator(Calibrator):
         est = IdentityEstimator(n_classes)
         est.fit(X, y)
 
-        # tried this workaround for deprecation warnings, but it doesn't work, gives the following error message:
-        # sklearn.utils._param_validation.InvalidParameterError: The 'estimator' parameter of cross_val_predict
-        # must be an object implementing 'fit' and 'predict'.
-        # Got FrozenEstimator(estimator=IdentityEstimator(n_classes=4)) instead.
+        # tried this workaround for deprecation warnings, but it complains in case of missing classes because it still tries to fit the estimator
         # try:
         #     # cv='prefit' option is deprecated from sklearn 1.6, FrozenEstimator was introduced in sklearn 1.6
         #     from sklearn.frozen import FrozenEstimator
-        #     self.calib_ = CalibratedClassifierCV(FrozenEstimator(est), method=self.method)
+        #     self.calib_ = CalibratedClassifierCV(FrozenEstimator(est), method=self.method, cv=[(np.arange(0), np.arange(X.shape[0]))])
         # except ImportError:
         #     self.calib_ = CalibratedClassifierCV(est, method=self.method, cv=self.cv)
 
@@ -672,6 +712,8 @@ def get_calibrator(calibration_method: str, calibrate_with_mixture: bool = False
                                                            max_iter=config.get('ts_max_iter', 100))
     elif calibration_method == 'guo-ts':
         cal = GuoTemperatureScalingCalibrator()
+    elif calibration_method == 'torchcal-ts':
+        cal = TorchcalTemperatureScalingCalibrator()
     elif calibration_method == 'autogluon-ts':
         cal = AutoGluonTemperatureScalingCalibrator(init_val=config.get('ts_init_val', 1),
                                                     max_iter=config.get('ts_max_iter', 200),
