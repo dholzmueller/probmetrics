@@ -158,10 +158,11 @@ class CategoricalProbs(CategoricalDistribution):
         self.logits = None
         self.probs = probs
         self.modes = None
+        self.thresh = np.log(np.finfo(np.float32).tiny)
 
     def get_logits(self) -> torch.Tensor:
         if self.logits is None:
-            self.logits = torch.log(self.probs + 1e-30)
+            self.logits = torch.clip(torch.log(self.probs), min=self.thresh)
         return self.logits
 
     def get_probs(self) -> torch.Tensor:
@@ -200,11 +201,12 @@ class CategoricalDirac(CategoricalDistribution):
         self.labels = labels
         self.probs = None
         self.logits = None
+        self.thresh = np.log(np.finfo(np.float32).tiny)
 
     def get_logits(self) -> torch.Tensor:
         if self.logits is None:
             self.probs = to_one_hot(self.labels, self.n_classes)
-            self.logits = torch.log(self.probs + 1e-30)
+            self.logits = torch.clip(torch.log(self.probs), min=self.thresh)
         return self.logits
 
     def get_probs(self) -> torch.Tensor:

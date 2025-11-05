@@ -7,16 +7,21 @@
 This package (PyTorch-based) currently contains
 - classification metrics, especially also 
 metrics for assessing the quality of probabilistic predictions, and
-- post-hoc calibration methods, especially 
-  a fast and accurate implementation of temperature scaling.
+- post-hoc calibration methods, especially
+  - a fast and accurate implementation of temperature scaling.
+  - an implementation of structured matrix scaling (SMS), 
+    a regularized version of matrix scaling that outperforms other 
+    logistic-based calibration functions.
 
-It accompanies our paper
-[Rethinking Early Stopping: Refine, Then Calibrate](https://arxiv.org/abs/2501.19195).
-Please cite our paper if you use this repository for research purposes.
-The experiments from the paper can be found here: 
-[vision](https://github.com/eugeneberta/RefineThenCalibrate-Vision), 
-[tabular](https://github.com/dholzmueller/pytabkit), 
-[theory](https://github.com/eugeneberta/RefineThenCalibrate-Theory).
+It accompanies our papers
+[Rethinking Early Stopping: Refine, Then Calibrate](https://arxiv.org/abs/2501.19195) and [Structured Matrix Scaling for Multi-Class Calibration](https://arxiv.org/abs/?).
+Please cite us if you use this repository for research purposes.
+The experiments from the papers can be found here: 
+- Rethinking Early Stopping:
+  - [vision experiments](https://github.com/eugeneberta/RefineThenCalibrate-Vision).
+  - [tabular experiments](https://github.com/dholzmueller/pytabkit).
+  - [theory](https://github.com/eugeneberta/RefineThenCalibrate-Theory).
+- Structured Matrix Scaling: [all experiments](https://github.com/eugeneberta/SoftmaxCalibration).
 
 ## Installation
 
@@ -33,49 +38,78 @@ To obtain all functionality, install `probmetrics[extra,dev,dirichletcal]`.
 - dirichletcal installs Dirichlet calibration, 
   which however only works for Python 3.12 upwards.
 
-## Using temperature scaling
+## Using post-hoc calibration methods
 
-We provide a highly efficient implementation of temperature scaling
-that, unlike some other implementations, 
-does not suffer from optimization issues.
-
-### Numpy interface
-
+You can create a calibrator as follows:
 ```python
 from probmetrics.calibrators import get_calibrator
+
+calib = get_calibrator('logistic')
+```
+
+These are the main supported methods:
+- `'logistic'` defaults to structured matrix scaling (SMS) for multiclass 
+  and affine scaling for binary calibration. 
+  We recommend using `'logistic'` for best results, 
+  especially on multiclass problems. 
+  It can be slow for larger numbers of classes. Only runs on CPU. 
+  The first call is slower due to numba compilation.
+- `'svs'`: Structured vector scaling (SVS) for multiclass problems, 
+  faster than SMS for multiclass while being almost as good in many cases.
+- `'quadratic-scaling'`: Quadratic scaling for binary problems, 
+  outperforms `'logistic'` (affine scaling) in our benchmarks.
+- `'temp-scaling'`: Our 
+  [highly efficient implementation of temperature scaling](https://arxiv.org/abs/2501.19195)
+  that, unlike some other implementations, 
+  does not suffer from optimization issues. 
+  Temperature scaling is not as expressive as matrix or vector scaling variants,
+  but it is faster and has the least overfitting risk.
+- `'ts-mix'`: Same as `'temp-scaling'` but with Laplace smoothing 
+  (slightly preferable for logloss). Can also be achieved using 
+  `get_calibrator('temp-scaling', calibrate_with_mixture=True)`
+- `'isotonic'` Isotonic regression from scikit-learn. 
+  Isotonic variants can be good for binary classification with enough data (around 10K samples or more)
+- `'ivap'` Inductive Venn-Abers predictor (a version of isotonic regression, slow but a bit better)
+- `'cir'` Centered isotonic regression (slightly better and slower than isotonic)
+- `'dircal'` Dirichlet calibration (slow, logistic performs better in our experiments)
+- `'dircal-cv'` Dirichlet calibration optimized with cross-validation (very slow)
+
+More details on parameters and other methods can be found in the get_calibrator function 
+[here](https://github.com/dholzmueller/probmetrics/probmetrics/calibrators.py).
+
+### Usage with `numpy`
+
+```python
 import numpy as np
 
 probas = np.asarray([[0.1, 0.9]])  # shape = (n_samples, n_classes)
 labels = np.asarray([1])  # shape = (n_samples,)
-# this is the version with Laplace smoothing, 
-# use calibrate_with_mixture=False (the default) for no Laplace smoothing
-calib = get_calibrator('temp-scaling', calibrate_with_mixture=True)
-# other option: calib = MixtureCalibrator(TemperatureScalingCalibrator())
-# there is also a fit_torch / predict_proba_torch interface
 calib.fit(probas, labels)
 calibrated_probas = calib.predict_proba(probas)
 ```
 
-### PyTorch interface
+### Usage with PyTorch
 
-The PyTorch version can be used directly with GPU tensors, but 
-this can actually be slower than CPU for smaller validation sets (around 1K-10K samples).
+The PyTorch version can be used directly with GPU tensors, 
+which is leveraged by our temperature scaling implementation 
+but not by most other methods.
+For temperature scaling, this could accelerate things, 
+but the CPU version can be faster 
+for smaller validation sets (around 1K-10K samples).
 
 ```python
 from probmetrics.distributions import CategoricalProbs
-from probmetrics.calibrators import get_calibrator
 import torch
 
 probas = torch.as_tensor([[0.1, 0.9]])
 labels = torch.as_tensor([1])
 
-# temp-scaling with Laplace smoothing
-calib = get_calibrator('ts-mix')
-
 # if you have logits, you can use CategoricalLogits instead
 calib.fit_torch(CategoricalProbs(probas), labels)
-calib.predict_proba_torch(CategoricalProbs(probas))
+result = calib.predict_proba_torch(CategoricalProbs(probas))
+calibrated_probas = result.get_probs()
 ```
+
 
 ## Using our refinement and calibration metrics
 
@@ -132,11 +166,18 @@ Metrics.get_available_names(metric_type=MetricType.CLASS)
 
 While there are some classes for regression metrics, they are not implemented.
 
+## Contributors
+- David Holzmüller
+- Eugène Berta
 
 ## Releases
 
+- v1.0.0: New post-hoc calibrators like `'logistic'` 
+  including structured matrix scaling (SMS), 
+  structured vector scaling (SVS), 
+  affine scaling, and quadratic scaling.
 - v0.0.2:
-  - Removed numpy<2.0 constraint, 
+  - Removed numpy<2.0 constraint
   - allow 1D vectors in CategoricalLogits / CategoricalProbs
   - add TorchCal temperature scaling
   - minor fixes in AutoGluon temperature scaling 
