@@ -1,9 +1,21 @@
 import warnings
 from typing import Callable, Optional, List
 
-import numpy as np
-import sklearn
 import torch
+import sklearn
+import logging
+import numpy as np
+from probmetrics.saga import (
+    fit_affine_scaling,
+    warm_up_affine_scaling,
+    fit_quadratic_scaling,
+    warm_up_quadratic_scaling,
+    fit_vector_scaling,
+    warm_up_vector_scaling,
+    fit_matrix_scaling,
+    warm_up_matrix_scaling
+)
+from probmetrics.utils import binary_probs_to_logits, multiclass_probs_to_logits, validate_probabilities
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
@@ -11,6 +23,7 @@ from torch import nn
 
 from probmetrics.distributions import CategoricalDistribution, CategoricalProbs, CategoricalLogits
 
+logger = logging.getLogger(__name__)
 
 class Calibrator(BaseEstimator, ClassifierMixin):
     """
@@ -165,6 +178,574 @@ class TemperatureScalingCalibrator(Calibrator):
 
     def predict_proba_torch(self, y_pred: CategoricalDistribution) -> CategoricalDistribution:
         return CategoricalLogits(self.invtemp_ * y_pred.get_logits())
+
+
+### New binary calibrators ###
+
+class BinaryLogisticCalibrator(Calibrator):
+    """
+    Binary post-hoc calibration with linear, affine or quadratic scaling 
+    on the binary logits using sklearn's LogisticRegression.
+
+    This class fits a model of the form:
+    P(y=1) = sigma(calibrated_logit)
+    
+    Where `calibrated_logit` depends on the `type`:
+    - 'linear':    calibrated_logit = w * logit (Temperature scaling with inverse temperature)
+    - 'affine':    calibrated_logit = b + w * logit (Platt scaling)
+    - 'quadratic': calibrated_logit = b + w1 * logit + w2 * logit^2
+    """
+
+    VALID_TYPES = ['linear', 'affine', 'quadratic']
+
+    def __init__(self, type: str = 'affine'):
+        """
+        Args:
+            type (str, optional): The type of scaling. 
+                One of ['linear', 'affine', 'quadratic']. 
+                Defaults to 'affine'.
+        """
+        super().__init__()
+        
+        if type not in self.VALID_TYPES:
+            raise ValueError(
+                f"Invalid type '{type}'. Must be one of {self.VALID_TYPES}"
+            )
+        self.type = type
+        self.cal_ = None
+
+    def _get_logits(self, X: np.ndarray) -> np.ndarray:
+        logits = binary_probs_to_logits(X)
+        logits = logits.reshape(-1,1)
+        if self.type == 'affine':
+            # Adding a constant term to logit vectors.
+            logits = np.hstack([np.ones((len(X), 1)), logits])
+        elif self.type == 'quadratic':
+            # Adding a constant and quadratic term to logit vectors.
+            logits = np.hstack([np.ones((len(X), 1)), logits, np.square(logits)])
+        return logits
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fits the logistic regression calibrator."""
+        from sklearn.linear_model import LogisticRegression
+        self.cal_ = LogisticRegression(penalty=None, fit_intercept=False)
+
+        features = self._get_logits(X)
+        self.cal_.fit(features, y)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Generates calibrated probability estimates."""
+        if self.cal_ is None:
+            raise RuntimeError("Calibrator has not been fitted yet. Call fit() before predict_proba().")
+
+        features = self._get_logits(X)
+        return self.cal_.predict_proba(features)
+
+class AffineScalingCalibrator(Calibrator):
+    """
+    Binary post-hoc calibration with Platt scaling (~binary logistic regression) $sigmoid(ax+b)$ on the logits x.
+    Uses the SAGA algorithm to fit the scaling and intercept parameters a & b.
+    Numba functions are warmed-up the first time the class is initialized (~1s).
+    A penalty (one of ["mcp", "lasso", "ridge"]) can be applied to the intercept parameter b, with regularization strength lambda_intercept.
+    To apply no regularization, leave penalty to None.
+    """
+    _warmed_up = False
+
+    def __init__(
+        self,
+        penalty: str = None,
+        lambda_intercept: float = 0.0,
+        max_iter: int = 200,
+        tol: float = 1e-4,
+        print_init_info: bool = True
+    ):
+        super().__init__()
+        self.penalty = penalty
+        self.lambda_intercept = lambda_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.print_init_info = print_init_info
+
+        self.w = None
+
+        if not AffineScalingCalibrator._warmed_up:
+            if self.print_init_info:
+                print("First AffineScalingCalibrator instantiation - warming up Numba functions...")
+            warm_up_affine_scaling()
+            AffineScalingCalibrator._warmed_up = True
+            if self.print_init_info:
+                print("Warmed up!")
+
+    def _get_logits(self, X: np.ndarray) -> np.ndarray: 
+        logits = binary_probs_to_logits(X)
+        logits = logits.reshape(-1,1)
+        # Adding a constant term to logit vectors to fit the intercept b.
+        logits = np.hstack([np.ones((len(X), 1)), logits])
+        return logits
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        logits = self._get_logits(X)
+        self.w = fit_affine_scaling(
+            logits, y,
+            penalty=self.penalty,
+            reg_intercept=self.lambda_intercept,
+            max_iter=self.max_iter,
+            tol=self.tol,
+        )
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.w is None:
+            raise RuntimeError("Calibrator has not been fitted yet. Call fit() before predict_proba().")
+
+        logits = self._get_logits(X)
+        logits = logits.dot(self.w).reshape(-1,1)
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        return np.hstack([1-probs, probs])
+
+
+class QuadraticScalingCalibrator(Calibrator):
+    """
+    Binary post-hoc calibration with quadratic scaling $sigmoid(a + bx + cx^2)$ on the logits x.
+    Uses the SAGA algorithm to fit the intercept, scaling and quadratic parameters a, b & c.
+    Numba functions are warmed-up the first time the class is initialized (~1s).
+    A penalty (one of ["mcp", "lasso", "ridge"]) can be applied to the intercept and quadratic parameters a & c,
+    with respective regularization strength lambda_intercept and lambda_quadratic.
+    To apply no regularization, leave penalty to None.
+    """
+    _warmed_up = False
+
+    def __init__(
+        self,
+        penalty: str = None,
+        lambda_intercept: float = 0.0,
+        lambda_quadratic: float = 0.0,
+        max_iter: int = 200,
+        tol: float = 1e-4,
+        print_init_info: bool = True
+    ):
+        super().__init__()
+        self.penalty = penalty
+        self.lambda_intercept = lambda_intercept
+        self.lambda_quadratic = lambda_quadratic
+        self.max_iter = max_iter
+        self.tol = tol
+        self.print_init_info = print_init_info
+
+        self.w = None
+
+        if not QuadraticScalingCalibrator._warmed_up:
+            if self.print_init_info:
+                print("First QuadraticScalingCalibrator instantiation - warming up Numba functions...")
+            warm_up_quadratic_scaling()
+            QuadraticScalingCalibrator._warmed_up = True
+            if self.print_init_info:
+                print("Warmed up!")
+
+    def _get_logits(self, X: np.ndarray) -> np.ndarray: 
+        logits = binary_probs_to_logits(X)
+        logits = logits.reshape(-1,1)
+        # Adding a constant and quadratic term to logit vectors.
+        logits = np.hstack([np.ones((len(X), 1)), logits, np.square(logits)])
+        return logits
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:        
+        logits = self._get_logits(X)
+        self.w = fit_quadratic_scaling(
+            logits, y,
+            penalty=self.penalty,
+            reg_intercept=self.lambda_intercept,
+            reg_quadratic=self.lambda_quadratic,
+            max_iter=self.max_iter,
+            tol=self.tol,
+        )
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.w is None:
+            raise RuntimeError("Calibrator has not been fitted yet. Call fit() before predict_proba().")
+
+        logits = self._get_logits(X)
+        logits = logits.dot(self.w).reshape(-1,1)
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        return np.hstack([1-probs, probs])
+
+##################################
+
+
+### New multiclass calibrators ###
+
+class SVSCalibrator(Calibrator):
+    """
+    Multiclass post-hoc calibration with a structured scaling scheme $softmax((aI + diag(v))x + b)$ on the logits x.
+
+    Numba functions are warmed-up the first time the class is initialized with the 'saga' optimizer.
+        
+    A penalty (one of [None, "mcp", "lasso", "ridge"]) is applied to the intercept (b) and vector scaling (v) parameters,
+    with respective regularization strength lambda_intercept*(k**rho)/(n**tau) and lambda_diagonal*(k**rho)/(n**tau).
+    Note that the general scaling parameter (a) is not regularized, just like in classical temperature scaling.
+
+    [!] solver = 'bfgs' only supports 'ridge' penalty.
+    [!] For solver = 'bfgs', max_iter and tol are ignored and default torchmin parameters are used.
+    """
+    _warmed_up_saga = False
+    _ALLOWED_PENALTIES = [None, "mcp", "lasso", "ridge"]
+    _ALLOWED_OPTIMIZERS = ["saga", "bfgs"]
+
+    def __init__(
+        self,
+        penalty: str = 'ridge',
+        rho: float = 1.0,
+        tau: float = 1.0,
+        lambda_intercept: float = 1.0,
+        lambda_diagonal: float = 1.0,
+        max_iter: int = 500,
+        tol: float = 1e-5,
+        opt: str = 'saga',
+        ts_preprocessing: bool = True,
+        print_init_info: bool = True
+    ):
+        super().__init__()
+
+        if opt not in self._ALLOWED_OPTIMIZERS:
+            raise ValueError(f"Optimizer '{opt}' not recognized. Choose from {self._ALLOWED_OPTIMIZERS}.")
+        if penalty not in self._ALLOWED_PENALTIES:
+            raise ValueError(f"Penalty '{penalty}' not recognized. Choose from {self._ALLOWED_PENALTIES}.")
+
+        if opt == 'saga' and not SVSCalibrator._warmed_up_saga:
+            if print_init_info:
+                logger.info("First SVSCalibrator instantiation with 'saga' - warming up Numba functions...")
+            warm_up_vector_scaling()
+            SVSCalibrator._warmed_up_saga = True
+            if print_init_info:
+                logger.info("Warmed up!")
+
+        if opt == 'bfgs' and penalty != 'ridge':
+            raise ValueError("The 'bfgs' optimizer only supports the 'ridge' penalty.")
+
+        if opt == 'bfgs':
+            try:
+                import torchmin
+            except ImportError:
+                raise ImportError("The 'torchmin' package is required for the 'bfgs' optimizer. Please install it.")
+
+        self.penalty = penalty
+        self.rho = rho
+        self.tau = tau
+        self.lambda_intercept = lambda_intercept
+        self.lambda_diagonal = lambda_diagonal
+        self.max_iter = max_iter
+        self.tol = tol
+        self.opt = opt
+        self.ts_preprocessing = ts_preprocessing
+        self.print_init_info = print_init_info
+
+        self.a = None
+        self.v = None
+        self.b = None
+        self.ts = None
+
+    def _get_logits(self, X: np.ndarray) -> tuple[np.ndarray, int, int]:
+        n, k = X.shape
+        logits = multiclass_probs_to_logits(X)
+        return logits, n, k
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        validate_probabilities(X)
+
+        if self.ts_preprocessing:
+            self.ts = get_calibrator('ts-mix')
+            self.ts.fit(X, y)
+            probs_to_calibrate = self.ts.predict_proba(X)
+        else:
+            self.ts = None
+            probs_to_calibrate = X
+        
+        logits, n, k = self._get_logits(probs_to_calibrate)
+
+        self.a = 1.0
+        self.v = np.zeros(k)
+        self.b = np.zeros(k)
+
+        reg_intercept = self.lambda_intercept * (k**self.rho) / (n**self.tau)
+        reg_diagonal = self.lambda_diagonal * (k**self.rho) / (n**self.tau)
+
+        if self.opt == 'saga':
+            self.a, self.v, self.b = fit_vector_scaling(
+                logits, y,
+                init_scaling=1.0,
+                penalty=self.penalty,
+                reg_intercept=reg_intercept,
+                reg_diagonal=reg_diagonal,
+                max_iter=self.max_iter,
+                tol=self.tol,
+            )
+
+        elif self.opt == 'bfgs':
+            self._fit_bfgs(
+                torch.tensor(logits), torch.tensor(y),
+                num_classes=k,
+                reg_intercept=reg_intercept,
+                reg_diagonal=reg_diagonal
+            )
+
+    def _fit_bfgs(self, logits: torch.Tensor, y: torch.Tensor, num_classes, reg_intercept, reg_diagonal):
+        import torchmin
+
+        a = torch.tensor([1.0], device=logits.device, requires_grad=True)
+        v = torch.zeros(num_classes, device=logits.device, requires_grad=True)
+        b = torch.zeros(num_classes, device=logits.device, requires_grad=True)
+
+        params = torch.cat([a, v, b])
+
+        def loss(params):
+            a, v, b = params.split([1, num_classes, num_classes])
+            logloss = torch.nn.functional.cross_entropy((a + v) * logits + b, y)
+            reg = reg_intercept * torch.dot(b, b) + reg_diagonal * torch.dot(v, v)
+            return logloss + reg
+
+        res = torchmin.bfgs._minimize_bfgs(loss, params)
+
+        a, v, b = res.x.split([1, num_classes, num_classes])
+
+        self.a = a.item()
+        self.v = v.detach().cpu().numpy()
+        self.b = b.detach().cpu().numpy()
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        validate_probabilities(X)
+
+        if self.a is None:
+            raise RuntimeError("Calibrator has not been fitted yet. Call fit() before predict_proba().")
+
+        if self.ts_preprocessing:
+            probs_to_calibrate = self.ts.predict_proba(X) 
+        else:
+            probs_to_calibrate = X
+        
+        logits, _, _ = self._get_logits(probs_to_calibrate)
+        
+        calibrated_logits = (self.a + self.v.reshape(1,-1)) * logits + self.b.reshape(1,-1)
+        calibrated_logits -= np.max(calibrated_logits, axis=1, keepdims=True)
+        exp_logits = np.exp(calibrated_logits)
+        return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+
+class SMSCalibrator(Calibrator):
+    """
+    Multiclass post-hoc calibration with a structured scaling scheme $softmax( (aI + diag(v) + off_diag(M) )x + b)$ on the logits x.
+
+    Numba functions are warmed-up the first time the class is initialized with the 'saga' optimizer.
+
+    A penalty (one of ["mcp", "lasso", "group_lasso", "ridge"]) is applied to the intercept (b), vector scaling (v) and off diagonal (M) parameters,
+    with respective regularization strength lambda_intercept*(k**rho)/(n**tau), lambda_diagonal*(k**rho)/(n**tau) and lambda_off_diagonal*((k*(k-1))**rho)/(n**tau).
+    Note that the general scaling parameter (a) is not regularized, just like in classical temperature scaling.
+
+    [!] The 'bfgs' solver only supports 'ridge' penalty.
+    [!] If 'bfgs' solver is used, max_iter and tol are ignored and default torchmin parameters are used.
+    """
+    _warmed_up_saga = False
+    _ALLOWED_PENALTIES = [None, "mcp", "lasso", "group_lasso", "ridge"]
+    _ALLOWED_OPTIMIZERS = ["saga", "bfgs"]
+
+    def __init__(
+        self,
+        penalty: str = 'ridge',
+        rho: float = 1.0,
+        tau: float = 1.0,
+        lambda_intercept: float = 1.0,
+        lambda_diagonal: float = 1.0,
+        lambda_off_diagonal: float = 1.0,
+        max_iter: int = 500,
+        tol: float = 1e-5,
+        opt: str = 'saga',
+        ts_preprocessing: bool = True,
+        print_init_info: bool = True
+    ):
+        super().__init__()
+
+        if opt not in self._ALLOWED_OPTIMIZERS:
+            raise ValueError(f"Optimizer '{opt}' not recognized. Choose from {self._ALLOWED_OPTIMIZERS}.")
+        if penalty not in self._ALLOWED_PENALTIES:
+            raise ValueError(f"Penalty '{penalty}' not recognized. Choose from {self._ALLOWED_PENALTIES}.")
+
+        if opt == 'saga' and not SMSCalibrator._warmed_up_saga:
+            if print_init_info:
+                logger.info("First SMSCalibrator instantiation with 'saga' - warming up Numba functions...")
+            warm_up_matrix_scaling()
+            SMSCalibrator._warmed_up_saga = True
+            if print_init_info:
+                logger.info("Warmed up!")
+
+        if opt == 'bfgs' and penalty != 'ridge':
+            raise ValueError("The 'bfgs' optimizer only supports the 'ridge' penalty.")
+
+        if opt == 'bfgs':
+            try:
+                import torchmin
+            except ImportError:
+                raise ImportError("The 'torchmin' package is required for the 'bfgs' optimizer. Please install it.")
+
+        self.penalty = penalty
+        self.rho = rho
+        self.tau = tau
+        self.lambda_intercept = lambda_intercept
+        self.lambda_diagonal = lambda_diagonal
+        self.lambda_off_diagonal = lambda_off_diagonal
+        self.max_iter = max_iter
+        self.tol = tol
+        self.opt = opt
+        self.ts_preprocessing = ts_preprocessing
+        self.print_init_info = print_init_info
+
+        self.W = None
+        self.ts = None
+
+    def _get_logits(self, X: np.ndarray) -> tuple[np.ndarray, int, int]:
+        n, k = X.shape
+        logits = multiclass_probs_to_logits(X)
+        # Adding a constant term to logit vectors to fit the intercept.
+        logits = np.hstack([logits, np.ones((n, 1))])
+        return logits, n, k
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fits the calibration matrix W."""
+        validate_probabilities(X)
+
+        if self.ts_preprocessing:
+            self.ts = get_calibrator('ts-mix')
+            self.ts.fit(X, y)
+            probs_to_calibrate = self.ts.predict_proba(X)
+        else:
+            self.ts = None
+            probs_to_calibrate = X
+
+        logits, n, k = self._get_logits(probs_to_calibrate)
+
+        self.W = np.hstack([np.eye(k), np.zeros((k, 1))])
+
+        reg_intercept=self.lambda_intercept * (k**self.rho) / (n**self.tau)
+        reg_diagonal=self.lambda_diagonal * (k**self.rho) / (n**self.tau)
+        reg_off_diagonal=self.lambda_off_diagonal * ((k*(k-1))**self.rho) / (n**self.tau)
+
+        if self.opt == 'saga':
+            self.W = fit_matrix_scaling(
+                logits, y,
+                penalty=self.penalty, max_iter=self.max_iter, tol=self.tol, init_scaling=1.0,
+                reg_intercept=reg_intercept, reg_diagonal=reg_diagonal, reg_off_diagonal=reg_off_diagonal
+            )
+
+        elif self.opt == 'bfgs':
+            self._fit_bfgs(
+                torch.tensor(logits), torch.tensor(y), num_classes=k,
+                reg_intercept=reg_intercept, reg_diagonal=reg_diagonal, reg_off_diagonal=reg_off_diagonal
+            )
+
+    def _fit_bfgs(self, logits: torch.Tensor, y: torch.Tensor, num_classes, reg_intercept, reg_diagonal, reg_off_diagonal):
+        import torchmin
+
+        a = torch.tensor([1.0], device=logits.device, dtype=logits.dtype)
+        W = torch.zeros((num_classes, num_classes + 1), device=logits.device, dtype=logits.dtype)
+
+        diag_mask = torch.hstack([torch.eye(num_classes), torch.zeros((num_classes, 1))])
+        off_diag_mask = torch.hstack([torch.ones((num_classes, num_classes)) - torch.eye(num_classes), torch.zeros((num_classes, 1))])
+        intercept_mask = torch.hstack([torch.zeros((num_classes, num_classes)), torch.ones((num_classes, 1))])
+
+        def loss(params):
+            a, W = params.split([1, num_classes*(num_classes+1)])
+            a = a.squeeze()
+            W = W.view(num_classes, num_classes+1)
+            loss = torch.nn.functional.cross_entropy(logits @ (a*diag_mask + W).T, y)
+            reg = reg_intercept*torch.square(intercept_mask * W).sum()
+            reg += reg_diagonal*torch.square(diag_mask * W).sum()
+            reg += reg_off_diagonal*torch.square(off_diag_mask * W).sum()
+            return loss + reg
+
+        params = torch.cat([a, W.view(-1)])
+        method = "l-bfgs" if params.numel() > 1000 else "bfgs"
+        res = torchmin.minimize(loss, params, method=method)
+
+        a, W = res.x.split([1, num_classes*(num_classes+1)])
+        W = W.view(num_classes, num_classes+1)
+
+        self.W = a.item()*diag_mask.numpy() + W.detach().cpu().numpy()
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        validate_probabilities(X)
+
+        if self.W is None:
+            raise RuntimeError("Calibrator has not been fitted yet. Call fit() before predict_proba().")
+
+        if self.ts_preprocessing:
+            probs_to_calibrate = self.ts.predict_proba(X) 
+        else:
+            probs_to_calibrate = X
+        
+        logits, _, _ = self._get_logits(probs_to_calibrate)
+        calibrated_logits = logits @ self.W.T
+        calibrated_logits -= np.max(calibrated_logits, axis=1, keepdims=True)
+        exp_logits = np.exp(calibrated_logits)
+        return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+##################################
+
+
+### Default logistic calibrator, compatible with binary and multiclass ###
+
+class LogisticCalibrator(Calibrator):
+    """
+    By default, uses 'affine-scaling' for binary classification and 'sms' for multiclass classification.
+    """
+
+    VALID_BINARY_TYPES = ['linear', 'affine', 'quadratic']
+    VALID_MULTICLASS_TYPES = ['svs', 'sms']
+
+    def __init__(self, binary_type: str = 'affine', multiclass_type: str = 'sms'):
+        super().__init__()
+        
+        if binary_type not in self.VALID_BINARY_TYPES:
+            raise ValueError(
+                f"Invalid binary type '{binary_type}'. Must be one of {self.VALID_BINARY_TYPES}"
+            )
+        self.binary_type = binary_type
+
+        if multiclass_type not in self.VALID_MULTICLASS_TYPES:
+            raise ValueError(
+                f"Invalid multiclass type '{multiclass_type}'. Must be one of {self.VALID_MULTICLASS_TYPES}"
+            )
+        self.multiclass_type = multiclass_type
+
+        self.cal_ = None
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        n_classes = len(np.unique(y))
+        
+        if n_classes == 2:
+            if self.binary_type == 'affine':
+                self.cal_ = BinaryLogisticCalibrator(type='affine')
+            elif self.binary_type == 'linear':
+                self.cal_ = BinaryLogisticCalibrator(type='linear')
+            elif self.binary_type == 'quadratic':
+                self.cal_ = BinaryLogisticCalibrator(type='quadratic')
+
+        else:
+            if self.multiclass_type == 'sms':
+                self.cal_ = SMSCalibrator(opt='bfgs')
+            elif self.multiclass_type == 'svs':
+                self.cal_ = SVSCalibrator(opt='bfgs')
+
+        self.cal_.fit(X, y)
+        return self
+
+    def predict(self, X):
+        if self.cal_ is None:
+            raise RuntimeError("LogisticCalibrator must be fitted before prediction.")
+        return self.cal_.predict(X)
+
+    def predict_proba(self, X):
+        if self.cal_ is None:
+            raise RuntimeError("LogisticCalibrator must be fitted before prediction.")
+        return self.cal_.predict_proba(X)
+
+##################################
 
 
 class GuoTemperatureScalingCalibrator(Calibrator):
@@ -388,6 +969,77 @@ class TorchcalTemperatureScalingCalibrator(Calibrator):
         return CategoricalLogits(y_pred.get_logits() / self.temperature)
 
 
+class TorchcalVectorScalingCalibrator(Calibrator):
+    # adapted from
+    # https://github.com/rishabh-ranjan/torchcal/blob/3fb65f6423d33d680cd68c7f40a0259d41e8fb0b/torchcal.py#L8
+    def __init__(self):
+        super().__init__()
+
+    def _fit_torch_impl(self, y_pred: CategoricalDistribution, y_true_labels: torch.Tensor):
+        import torchmin
+        y_pred_logits = y_pred.get_logits()
+
+        num_classes = y_pred_logits.shape[1]
+
+        self.temp = torch.ones(num_classes, device=y_pred_logits.device)
+        self.bias = torch.zeros(num_classes, device=y_pred_logits.device)
+
+        def loss(temp_bias):
+            temp, bias = temp_bias.split([num_classes, num_classes])
+            return torch.nn.functional.cross_entropy(y_pred_logits / temp + bias, y_true_labels)
+        temp_bias = torch.cat([self.temp, self.bias])
+        res = torchmin.minimize(loss, temp_bias, method="bfgs")
+        if not res.success:
+            warnings.warn(
+                f"{self.__class__}: {res.message} Not updating calibrator params."
+            )
+        else:
+            self.temp, self.bias = res.x.split([num_classes, num_classes])
+
+    def predict_proba_torch(self, y_pred: CategoricalDistribution) -> CategoricalDistribution:
+        return CategoricalLogits(y_pred.get_logits() / self.temp + self.bias)
+
+
+class TorchcalMatrixScalingCalibrator(Calibrator):
+    def __init__(self):
+        super().__init__()
+
+    def _fit_torch_impl(self, y_pred: CategoricalDistribution, y_true_labels: torch.Tensor):
+        import torchmin
+        y_pred_logits = y_pred.get_logits()
+
+        num_classes = y_pred_logits.shape[1]
+
+        num_params = num_classes*(num_classes + 1)
+        if num_params <= 1000:
+            method = "bfgs"
+        else:
+            method = "l-bfgs"
+
+        self.itemp = torch.eye(num_classes, num_classes, device=y_pred_logits.device, dtype=y_pred_logits.dtype)
+        self.bias = torch.zeros(num_classes, device=y_pred_logits.device, dtype=y_pred_logits.dtype)
+
+        def loss(itemp_bias):
+            itemp, bias = itemp_bias.split([num_classes**2, num_classes])
+            itemp = itemp.view(num_classes, num_classes)
+            return torch.nn.functional.cross_entropy(y_pred_logits @ itemp + bias, y_true_labels)
+
+        itemp_bias = torch.cat([self.itemp.view(-1), self.bias])
+        res = torchmin.minimize(loss, itemp_bias, method=method)
+        if not res.success:
+            warnings.warn(
+                f"{self.__class__}: {res.message} Not updating calibrator params."
+            )
+        else:
+            self.itemp, self.bias = res.x.split(
+                [num_classes**2, num_classes]
+            )
+            self.itemp = self.itemp.view(num_classes, num_classes)
+
+    def predict_proba_torch(self, y_pred: CategoricalDistribution) -> CategoricalDistribution:
+        return CategoricalLogits(y_pred.get_logits() @ self.itemp + self.bias)
+
+
 class CenteredIsotonicRegressionCalibrator(Calibrator):
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         assert not np.any(np.isnan(X))
@@ -565,6 +1217,45 @@ class IdentityEstimator(ClassifierMixin, BaseEstimator):
         raise NotImplementedError()
 
 
+class PreprocessingCalibratorWrapper(Calibrator):
+    def __init__(self, calibrator: Calibrator, pre_calib: Optional[Calibrator] = None, l2_normalize: bool = False):
+        super().__init__()
+        self.calibrator = calibrator
+        self.pre_calib = pre_calib
+        self.l2_normalize = l2_normalize
+
+        # options: robust scaling
+        # pre-TS
+
+    def _fit_torch_impl(self, y_pred: CategoricalDistribution, y_true_labels: torch.Tensor) -> 'Calibrator':
+        if self.pre_calib:
+            self.pre_calib_: Calibrator = sklearn.base.clone(self.pre_calib)
+            self.pre_calib_.fit_torch(y_pred, y_true_labels)
+            y_pred = self.pre_calib_.predict_proba_torch(y_pred)
+        if self.l2_normalize:
+            logits = y_pred.get_logits()
+            logits = logits - logits.mean(dim=-1, keepdim=True)
+            self.factor_ = 1. / (logits.square().mean().sqrt().item() + 1e-8)
+            logits = self.factor_ * logits
+            y_pred = CategoricalLogits(logits)
+
+        self.calib_: Calibrator = sklearn.base.clone(self.calibrator)
+        self.calib_.fit_torch(y_pred, y_true_labels)
+
+    def predict_proba_torch(self, y_pred: CategoricalDistribution) -> CategoricalDistribution:
+        if self.pre_calib:
+            y_pred = self.pre_calib_.predict_proba_torch(y_pred)
+        if self.l2_normalize:
+            logits = y_pred.get_logits()
+            logits = logits - logits.mean(dim=-1, keepdim=True)
+            logits = self.factor_ * logits
+            y_pred = CategoricalLogits(logits)
+
+        return self.calib_.predict_proba_torch(y_pred)
+
+
+
+
 class SklearnCalibrator(Calibrator):
     def __init__(self, method: str, cv: str):
         super().__init__()
@@ -572,6 +1263,9 @@ class SklearnCalibrator(Calibrator):
         self.cv = cv
 
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        if X.ndim == 1:
+            X = np.stack((1.0-X, X), axis=1)
+
         n_classes = X.shape[-1]
         est = IdentityEstimator(n_classes)
         est.fit(X, y)
@@ -589,6 +1283,9 @@ class SklearnCalibrator(Calibrator):
         self.classes_ = est.classes_
 
     def predict_proba(self, X):
+        if X.ndim == 1:
+            X = np.stack((1.0-X, X), axis=1)
+
         return self.calib_.predict_proba(X)
 
 
@@ -704,8 +1401,39 @@ def get_calibrator(calibration_method: str, calibrate_with_mixture: bool = False
                                            lr=config.get('ts_lr', 0.1),
                                            max_iter=config.get('ts_max_iter', 200),
                                            use_inv_temp=config.get('ts_use_inv_temp', True),
-                                           inv_temp_init=config.get('ts_inv_temp_init', 1 / 1.5),
-                                           )
+                                           inv_temp_init=config.get('ts_inv_temp_init', 1 / 1.5))
+    elif calibration_method == 'linear-scaling':
+        cal = BinaryLogisticCalibrator(type='linear')
+    elif calibration_method == 'affine-scaling':
+        cal = BinaryLogisticCalibrator(type='affine')
+    elif calibration_method == 'quadratic-scaling':
+        cal = BinaryLogisticCalibrator(type='quadratic')
+    elif calibration_method == 'svs':
+        cal = SVSCalibrator(penalty=config.get('svs_penalty', 'ridge'),
+                            rho=config.get('svs_rho', 1.0),
+                            tau=config.get('svs_tau', 1.0),
+                            lambda_intercept=config.get('svs_lambda_intercept', 1.0),
+                            lambda_diagonal=config.get('svs_lambda_diagonal', 1.0),
+                            max_iter=config.get('svs_max_iter', 500),
+                            tol=config.get('svs_tol', 1e-5),
+                            opt=config.get('svs_opt', 'saga'),
+                            ts_preprocessing=config.get('svs_ts_preprocessing', True),
+                            print_init_info=config.get('svs_print_init_info', True))
+    elif calibration_method == 'sms':
+        cal = SMSCalibrator(penalty=config.get('sms_penalty', 'ridge'),
+                            rho=config.get('sms_rho', 1.0),
+                            tau=config.get('sms_tau', 1.0),
+                            lambda_intercept=config.get('sms_lambda_intercept', 1.0),
+                            lambda_diagonal=config.get('sms_lambda_diagonal', 1.0),
+                            lambda_off_diagonal=config.get('sms_lambda_off_diagonal', 1.0),
+                            max_iter=config.get('sms_max_iter', 500),
+                            tol=config.get('sms_tol', 1e-5),
+                            opt=config.get('sms_opt', 'saga'),
+                            ts_preprocessing=config.get('sms_ts_preprocessing', True),
+                            print_init_info=config.get('sms_print_init_info', True))
+    elif calibration_method == 'logistic':
+        cal = LogisticCalibrator(binary_type=config.get('logistic_binary_type', 'affine'),
+                                 multiclass_type=config.get('logistic_multiclass_type', 'sms'))
     elif calibration_method == 'torchunc-ts':
         cal = TorchUncertaintyTemperatureScalingCalibrator(init_val=config.get('ts_init_val', 1),
                                                            lr=config.get('ts_lr', 0.1),

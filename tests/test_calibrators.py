@@ -11,10 +11,26 @@ from sklearn.model_selection import train_test_split
 
 from probmetrics.calibrators import Calibrator, VennAbersCalibrator, MulticlassOneVsRestCalibrator, \
     BinaryVennAbersCalibrator, MulticlassOneVsOneCalibrator, SklearnCalibrator, get_calibrator, \
-    TemperatureScalingCalibrator
+    TemperatureScalingCalibrator, PreprocessingCalibratorWrapper
 from probmetrics.distributions import CategoricalDirac, CategoricalProbs
 from probmetrics.metrics import BrierLoss, ClassificationMetric, SmoothCalibrationError, CalibrationError
 
+binary_only_calibrators = {'linear-scaling', 'affine-scaling', 'quadratic-scaling'}
+
+calibrator_specs = [
+    (name, get_calibrator(name)) for name in
+    [
+        'platt', 'isotonic', 'platt-logits', 'ivap-ovr', 'ivap-ovo', 'cir', 'temp-scaling', 'autogluon-ts', 'torchunc-ts',
+        'linear-scaling', 'affine-scaling', 'quadratic-scaling', 'logistic'
+    ]
+    ] + [
+        ('svs', get_calibrator('svs', svs_opt='bfgs')), # test with bfgs instead of saga since it is deterministic.
+        ('sms', get_calibrator('sms', sms_opt='bfgs')), # test with bfgs instead of saga since it is deterministic.
+        ('temp-scaling-lbfgs', TemperatureScalingCalibrator(opt='lbfgs')),
+        ('temp-scaling-mixture', get_calibrator('temp-scaling', calibrate_with_mixture=True)),
+    ]
+
+# [!] 'ivap' not running for test_calibrator_missing_class.
 
 def sample_labels(p: np.ndarray, random_state: Optional[int] = None) -> np.ndarray:
     """
@@ -75,15 +91,12 @@ def calib_dataset(request) -> Tuple[np.ndarray, np.ndarray]:
 #     np.testing.assert_allclose(cal1.predict_proba(X_test), cal2.predict_proba(X_test), atol=1e-7)
 
 @pytest.mark.parametrize('metric', [BrierLoss(), SmoothCalibrationError(), CalibrationError()])
-@pytest.mark.parametrize('calibrator', [
-    get_calibrator(name) for name in
-    ['platt', 'isotonic', 'platt-logits', 'ivap-ovr', 'ivap-ovo', 'cir', 'temp-scaling', 'autogluon-ts',
-     # 'dircal', 'dircal-cv',
-     'torchunc-ts', ]  # don't test guo because it's too bad
-] + [TemperatureScalingCalibrator(opt='lbfgs'), get_calibrator('temp-scaling', calibrate_with_mixture=True)])
-def test_calibrator_performance(metric: ClassificationMetric, calibrator: Calibrator,
+@pytest.mark.parametrize(('calibrator_name', 'calibrator'), calibrator_specs)
+def test_calibrator_performance(metric: ClassificationMetric, calibrator_name: str, calibrator: Calibrator,
                                 calib_dataset: Tuple[np.ndarray, np.ndarray]):
     X, y = calib_dataset
+    n_classes = X.shape[-1]
+
     # don't test with train/test split since it might fail due to overfitting
     # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
     #
@@ -96,11 +109,13 @@ def test_calibrator_performance(metric: ClassificationMetric, calibrator: Calibr
     # without_cal = metric.compute(y_true=y_true, y_pred=CategoricalProbs(torch.as_tensor(X_test))).item()
     # with_cal = metric.compute(y_true=y_true, y_pred=CategoricalProbs(torch.as_tensor(y_pred_probs))).item()
 
+    if calibrator_name in binary_only_calibrators and n_classes > 2:
+        pytest.skip(f"Skipping {calibrator_name} (binary-only) for {n_classes}-class dataset")
+
     cal = sklearn.base.clone(calibrator)
     cal.fit(X, y)
     y_pred_probs = cal.predict_proba(X)
 
-    n_classes = X.shape[-1]
     y_true = CategoricalDirac(torch.as_tensor(y), n_classes)
     without_cal = metric.compute(y_true=y_true, y_pred=CategoricalProbs(torch.as_tensor(X))).item()
     with_cal = metric.compute(y_true=y_true, y_pred=CategoricalProbs(torch.as_tensor(y_pred_probs))).item()
@@ -109,16 +124,15 @@ def test_calibrator_performance(metric: ClassificationMetric, calibrator: Calibr
     assert with_cal < without_cal
 
 
-@pytest.mark.parametrize('calibrator', [
-    get_calibrator(name) for name in
-    ['platt', 'isotonic', 'platt-logits', 'ivap-ovr', 'ivap-ovo', 'cir', 'temp-scaling',
-     # 'dircal', 'dircal-cv',
-     'ivap', 'autogluon-ts', 'guo-ts', 'autogluon-ts', ]
-] + [TemperatureScalingCalibrator(opt='lbfgs'), get_calibrator('temp-scaling', calibrate_with_mixture=True)])
-def test_calibrator_torch_vs_numpy(calibrator: Calibrator, calib_dataset: Tuple[np.ndarray, np.ndarray]):
+@pytest.mark.parametrize(('calibrator_name', 'calibrator'), calibrator_specs)
+def test_calibrator_torch_vs_numpy(calibrator_name: str, calibrator: Calibrator, calib_dataset: Tuple[np.ndarray, np.ndarray]):
     X, y = calib_dataset
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
     n_classes = X.shape[-1]
+
+    if calibrator_name in binary_only_calibrators and n_classes > 2:
+        pytest.skip(f"Skipping {calibrator_name} (binary-only) for {n_classes}-class dataset")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
 
     preds = []
     for train_torch in [False, True]:
@@ -139,16 +153,17 @@ def test_calibrator_torch_vs_numpy(calibrator: Calibrator, calib_dataset: Tuple[
         np.testing.assert_allclose(preds[i], preds[0], atol=1e-7)
 
 
-@pytest.mark.parametrize('calibrator', [
-    get_calibrator(name) for name in
-    ['platt', 'isotonic', 'platt-logits', 'ivap-ovr', 'ivap-ovo',
-     # 'dircal', 'dircal-cv',
-     'cir', 'temp-scaling', 'autogluon-ts', 'guo-ts', 'torchunc-ts']
-] + [TemperatureScalingCalibrator(opt='lbfgs'), get_calibrator('temp-scaling', calibrate_with_mixture=True)])
-def test_calibrator_missing_class(calibrator: Calibrator):
-    rng = np.random.default_rng(0)
+@pytest.mark.parametrize(('calibrator_name', 'calibrator'), calibrator_specs)
+def test_calibrator_missing_class(calibrator_name: str, calibrator: Calibrator):
     n_samples = 1000
-    X = rng.normal(size=(n_samples, 4))
+    n_classes = 4
+
+    if calibrator_name in binary_only_calibrators and n_classes > 2:
+        pytest.skip(f"Skipping {calibrator_name} (binary-only) for {n_classes}-class dataset")
+    
+    rng = np.random.default_rng(0)
+    X = rng.uniform(size=(n_samples, n_classes))
+    X = X / X.sum(axis=1, keepdims=True)
     y = rng.choice([0, 2, 3], size=n_samples, replace=True)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5)
 
