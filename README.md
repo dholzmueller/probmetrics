@@ -21,7 +21,8 @@ The experiments from the papers can be found here:
   - [vision experiments](https://github.com/eugeneberta/RefineThenCalibrate-Vision).
   - [tabular experiments](https://github.com/dholzmueller/pytabkit).
   - [theory](https://github.com/eugeneberta/RefineThenCalibrate-Theory).
-- Structured Matrix Scaling: [all experiments](https://github.com/eugeneberta/SoftmaxCalibration).
+- Structured Matrix Scaling: 
+  [all experiments](https://github.com/eugeneberta/LogisticCalibrationBenchmark).
 
 ## Installation
 
