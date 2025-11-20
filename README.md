@@ -14,7 +14,7 @@ metrics for assessing the quality of probabilistic predictions, and
     logistic-based calibration functions.
 
 It accompanies our papers
-[Rethinking Early Stopping: Refine, Then Calibrate](https://arxiv.org/abs/2501.19195) and [Structured Matrix Scaling for Multi-Class Calibration](https://arxiv.org/abs/?).
+[Rethinking Early Stopping: Refine, Then Calibrate](https://arxiv.org/abs/2501.19195) and [Structured Matrix Scaling for Multi-Class Calibration](https://arxiv.org/abs/2511.03685).
 Please cite us if you use this repository for research purposes.
 The experiments from the papers can be found here: 
 - Rethinking Early Stopping:
