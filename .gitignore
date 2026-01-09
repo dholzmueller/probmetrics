@@ -1,6 +1,9 @@
 *.pyc
 *.pdf
 *.zip
+*.DS_Store
+*__pycache__
+
 
 experiments/*/
 !experiments/prototypes

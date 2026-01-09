@@ -173,6 +173,13 @@ While there are some classes for regression metrics, they are not implemented.
 
 ## Releases
 
+- v1.1.0: Improvements to the SVS and SMS calibrators:
+  - logit pre-processing with `'ts-mix'` is now automatic, and the global scaling parameter $\alpha$ is fixed to 1. This yields:
+    - improved performance on our tabular and computer vision benchmarks (see the arxiv v2 of the SMS paper, coming soon).
+    - faster convergence.
+    - ability to compute the duality gap in closed form for stopping SAGA solvers, which we implement in this version.
+  - improved L-BFGS solvers, much faster than in the previous version. Now the solver for default SVS and SMS.
+  - the default binary calibrator in `LogisticCalibrator` is now quadratic-scaling instead of affine scaling.
 - v1.0.0: New post-hoc calibrators like `'logistic'` 
   including structured matrix scaling (SMS), 
   structured vector scaling (SVS), 

@@ -8,6 +8,34 @@ from .utils import _fast_shuffle, _soft_threshold, _mcp_threshold, _mcp_penalty
 L_FACTOR = 0.25
 ETA_DIVISOR = 3.0
 
+# Logit computation
+@njit(fastmath=True, cache=True)
+def _compute_logits(
+    xi: np.ndarray, v: np.ndarray, b: np.ndarray, k: int,
+    logits: np.ndarray, exp_logits: np.ndarray
+) -> float:
+    """
+    Computes numerically stable exp(logits) for a single sample.
+    This function modifies logits and exp_logits in-place.
+
+    Returns:
+        The sum of the exponentiated logits (sum_exp).
+    """
+    max_logit = -np.inf
+    for j in range(k):
+        logit = (1.0 + v[j]) * xi[j] + b[j]
+        logits[j] = logit
+        if logit > max_logit:
+            max_logit = logit
+
+    sum_exp = 0.0
+    for j in range(k):
+        exp_logit = math.exp(logits[j] - max_logit)
+        exp_logits[j] = exp_logit
+        sum_exp += exp_logit
+    
+    return sum_exp
+
 # Proximal operators
 @njit(fastmath=True, cache=True)
 def _prox_mcp(vec: np.ndarray, k: int, step_size: float, lmbda: float) -> None:
@@ -36,45 +64,13 @@ def _prox_ridge(vec: np.ndarray, k: int, step_size: float, lmbda: float) -> None
 def _prox_none(vec: np.ndarray, k: int, step_size: float, lmbda: float) -> None:
     pass
 
-# Logit computation
-@njit(fastmath=True, cache=True)
-def _compute_logits(
-    xi: np.ndarray, a: float, v: np.ndarray, b: np.ndarray, k: int,
-    logits: np.ndarray, exp_logits: np.ndarray
-) -> float:
-    """
-    Computes numerically stable exp(logits) for a single sample.
-
-    This function modifies logits and exp_logits in-place.
-
-    Returns:
-        The sum of the exponentiated logits (sum_exp).
-    """
-    # Part 1: Compute logits and find the maximum
-    max_logit = -np.inf
-    for j in range(k):
-        logit = (a + v[j]) * xi[j] + b[j]
-        logits[j] = logit
-        if logit > max_logit:
-            max_logit = logit
-
-    # Part 2: Compute stable exp(logits) and their sum
-    sum_exp = 0.0
-    for j in range(k):
-        exp_logit = math.exp(logits[j] - max_logit)
-        exp_logits[j] = exp_logit
-        sum_exp += exp_logit
-    
-    return sum_exp
-
 # Stopping functions
 @njit(fastmath=True, cache=True)
 def _compute_primal_dual_ridge(
-    X: np.ndarray, y: np.ndarray, a: float, v: np.ndarray, b: np.ndarray,
+    X: np.ndarray, y: np.ndarray, v: np.ndarray, b: np.ndarray,
     reg_intercept: float, reg_diagonal: float
 ) -> Tuple[float, float]:
     """Computes primal and (approximate) dual objectives for our structured vector scaling convex problem with ridge regularization.
-    The dual is only approximate since global scaling parameter a is not regularized. This sometimes leads to dual_obj > primal_obj.
     """
     n, k = X.shape
     
@@ -90,15 +86,15 @@ def _compute_primal_dual_ridge(
         xi, yi = X[i], y[i]
 
         sum_exp = _compute_logits(
-            xi, a, v, b, k, logits, exp_logits
+            xi, v, b, k, logits, exp_logits
         )
         
         for j in range(k):
             prob = exp_logits[j] / sum_exp
-            alpha_ij = -prob
+            alpha_ij = prob
             dual_loss -= prob * math.log(prob)
             if j == yi:
-                alpha_ij += 1.0
+                alpha_ij -= 1.0
                 primal_loss -= math.log(prob)
             s_v[j] += alpha_ij * xi[j]
             s_b[j] += alpha_ij
@@ -106,27 +102,28 @@ def _compute_primal_dual_ridge(
     primal_reg = reg_diagonal * np.dot(v, v) + reg_intercept * np.dot(b, b)
     primal_obj = (primal_loss / n) + primal_reg
 
-    dual_reg = 0.0
     n_squared = float(n * n)
-    dual_reg -= (1.0 / (4.0 * reg_diagonal * n_squared)) * np.dot(s_v, s_v)
-    dual_reg -= (1.0 / (4.0 * reg_intercept * n_squared)) * np.dot(s_b, s_b)
+    dual_reg = (- (1.0 / (4.0 * reg_diagonal * n_squared)) * np.dot(s_v, s_v)
+                - (1.0 / (4.0 * reg_intercept * n_squared)) * np.dot(s_b, s_b))
 
-    dual_obj = (dual_loss / n) + dual_reg
+    dual_lin = np.sum(s_v)
+
+    dual_obj = (dual_loss / n) + (dual_lin / n) + dual_reg
     
     return primal_obj, dual_obj
 
 @njit(fastmath=True, cache=True)
 def _compute_primal_dual_lasso(
-    X: np.ndarray, y: np.ndarray, a: float, v: np.ndarray, b: np.ndarray,
+    X: np.ndarray, y: np.ndarray, v: np.ndarray, b: np.ndarray,
     reg_intercept: float, reg_diagonal: float
 ) -> Tuple[float, float]:
     """Computes primal and (approximate) dual objectives for our structured vector scaling convex problem with LASSO regularization.
-    The dual is only approximate since global scaling parameter a is not regularized. This sometimes leads to dual_obj > primal_obj.
     """
     n, k = X.shape
     
     primal_loss = 0.0
     dual_loss = 0.0
+    dual_lin = 0.0
     
     logits = np.zeros(k)
     exp_logits = np.zeros(k)
@@ -135,26 +132,28 @@ def _compute_primal_dual_lasso(
         xi, yi = X[i], y[i]
 
         sum_exp = _compute_logits(
-            xi, a, v, b, k, logits, exp_logits
+            xi, v, b, k, logits, exp_logits
         )
         
         for j in range(k):
             prob = exp_logits[j] / sum_exp
+            alpha_ij = prob
             dual_loss -= prob * math.log(prob)
             if j == yi:
+                alpha_ij -= 1.0
                 primal_loss -= math.log(prob)
+            dual_lin += alpha_ij * xi[j]
 
     primal_reg = reg_diagonal * np.sum(np.abs(v)) + reg_intercept * np.sum(np.abs(b))
     primal_obj = (primal_loss / n) + primal_reg
 
-    dual_reg = 0.0
-    dual_obj = (dual_loss / n) + dual_reg
+    dual_obj = (dual_loss / n) + (dual_lin / n)
 
     return primal_obj, dual_obj
 
 @njit(fastmath=True, cache=True)
 def _compute_primal_dual_none(
-    X: np.ndarray, y: np.ndarray, a: float, v: np.ndarray, b: np.ndarray,
+    X: np.ndarray, y: np.ndarray, v: np.ndarray, b: np.ndarray,
     reg_intercept: float, reg_diagonal: float
 ) -> Tuple[float, float]:
     """Computes primal objective for our structured vector scaling convex problem without regularization.
@@ -171,7 +170,7 @@ def _compute_primal_dual_none(
         xi, yi = X[i], y[i]
 
         sum_exp = _compute_logits(
-            xi, a, v, b, k, logits, exp_logits
+            xi, v, b, k, logits, exp_logits
         )
         
         primal_loss -= math.log(exp_logits[yi] / sum_exp)
@@ -182,7 +181,7 @@ def _compute_primal_dual_none(
 
 @njit(fastmath=True, cache=True)
 def _compute_primal_dual_mcp(
-    X: np.ndarray, y: np.ndarray, a: float, v: np.ndarray, b: np.ndarray,
+    X: np.ndarray, y: np.ndarray, v: np.ndarray, b: np.ndarray,
     reg_intercept: float, reg_diagonal: float
 ) -> Tuple[float, float]:
     """Computes primal objective for our structured vector scaling convex problem with MCP regularization.
@@ -199,7 +198,7 @@ def _compute_primal_dual_mcp(
         xi, yi = X[i], y[i]
 
         sum_exp = _compute_logits(
-            xi, a, v, b, k, logits, exp_logits
+            xi, v, b, k, logits, exp_logits
         )
         
         primal_loss -= math.log(exp_logits[yi] / sum_exp)
@@ -216,7 +215,7 @@ def _compute_primal_dual_mcp(
 # SAGA solver
 @njit(fastmath=True, cache=True)
 def _saga_vector_scaling(
-    X: np.ndarray, y: np.ndarray, init_scaling: float, reg_intercept: float, reg_diagonal: float,
+    X: np.ndarray, y: np.ndarray, reg_intercept: float, reg_diagonal: float,
     max_iter: int, tol: float, prox_op: Callable[[np.ndarray, int, float, float], None], stop_op: Callable[..., float]
 ) -> Tuple[float, np.ndarray, np.ndarray, int]:
     """Solves our structured vector scaling convex optimization problem using SAGA.
@@ -224,7 +223,6 @@ def _saga_vector_scaling(
     Args:
         X (np.ndarray): un-calibrated logits.
         y (np.ndarray): un-calibrated labels (not one-hot encoded).
-        init_scaling (float): initial value for global scaling parameter.
         reg_intercept (float): regularization strenght applied to intercept parameters.
         reg_diagonal (float): regularization strenght applied to diagonal parameters.
         max_iter (int): max number of dataset passes before SAGA is stopped.
@@ -239,7 +237,6 @@ def _saga_vector_scaling(
     """
     n, k = X.shape
     
-    a = init_scaling
     v = np.zeros(k)
     b = np.zeros(k)
 
@@ -248,7 +245,6 @@ def _saga_vector_scaling(
 
     gradient_weights_memory = np.zeros((n, k))
     permutation = np.arange(n, dtype=np.int32)
-    avg_gradient_a = 0.0
     avg_gradient_v = np.zeros(k)
     avg_gradient_b = np.zeros(k)
     
@@ -266,10 +262,9 @@ def _saga_vector_scaling(
             xi, yi = X[i], y[i]
 
             sum_exp = _compute_logits(
-                xi, a, v, b, k, logits, exp_logits
+                xi, v, b, k, logits, exp_logits
             )
 
-            update_a = 0.0
             for j in range(k):
                 prob = exp_logits[j] / sum_exp
                 gradient_weight = prob - (1.0 if j == yi else 0.0)
@@ -277,8 +272,6 @@ def _saga_vector_scaling(
                 delta_grad[j] = gradient_weight - gradient_weights_memory[i, j]
                 gradient_weights_memory[i, j] = gradient_weight
                 
-                update_a += delta_grad[j] * xi[j]
-
                 update_v = delta_grad[j] * xi[j]
                 v[j] -= step_size * (update_v + avg_gradient_v[j])
                 if epoch == 1:
@@ -293,30 +286,24 @@ def _saga_vector_scaling(
                 else:
                     avg_gradient_b[j] += update_b / n
 
-            a -= step_size * (update_a + avg_gradient_a)
             if epoch == 1:
-                avg_gradient_a += (update_a - avg_gradient_a) / samples_seen
                 samples_seen += 1
-            else:
-                avg_gradient_a += update_a / n
 
             prox_op(v, k, step_size, reg_diagonal)
             prox_op(b, k, step_size, reg_intercept)
 
-        primal_obj, dual_obj = stop_op(X, y, a, v, b, reg_intercept, reg_diagonal)
+        primal_obj, dual_obj = stop_op(X, y, v, b, reg_intercept, reg_diagonal)
         if dual_obj == -np.inf:
             gap = abs(primal_obj - previous_objective)
             if gap <= tol * max(1.0, abs(primal_obj)):
-                return a, v, b, epoch
+                return v, b, epoch
             previous_objective = primal_obj
         else:
-            # Global scaling parameter a is not regularized, the duality gap is not exact and can be negative.
-            # For robustness, we track the absolute gap.
             gap = abs(primal_obj - dual_obj)
             if gap <= tol * max(1.0, abs(primal_obj)):
-                return a, v, b, epoch
+                return v, b, epoch
 
-    return a, v, b, max_iter
+    return v, b, max_iter
 
 # Dictionary mappings
 VECTOR_PROX_MAP = {
@@ -335,7 +322,7 @@ VECTOR_STOP_MAP = {
 
 # Public API functions
 def fit_vector_scaling(
-        X: np.ndarray, y: np.ndarray, init_scaling: float, penalty: str, reg_diagonal: float,
+        X: np.ndarray, y: np.ndarray, penalty: str, reg_diagonal: float,
         reg_intercept: float, max_iter: int, tol: float
 ) -> np.ndarray:
     """Public API to fit vector scaling using SAGA."""
@@ -345,18 +332,18 @@ def fit_vector_scaling(
     except KeyError:
         raise ValueError(f"Unknown penalty: {penalty}")
 
-    a, v, b, last_iter = _saga_vector_scaling(
-        X, y, init_scaling, reg_intercept, reg_diagonal,
+    v_delta, b, last_iter = _saga_vector_scaling(
+        X, y, reg_intercept, reg_diagonal,
         max_iter, tol, prox_op, stop_op
     )
     if last_iter == max_iter:
         warnings.warn("SAGA reached max_iter without convergence", RuntimeWarning)
     
-    return a, v, b
+    return 1.0 + v_delta, b
 
 def warm_up_vector_scaling():
     """Public API to warm up vector scaling."""
     X = np.random.randn(10, 3).astype(np.float32)
     y = np.random.randint(0, 3, size=10)
     for penalty in [None, 'mcp', 'lasso', 'ridge']:
-        _saga_vector_scaling(X, y, 1.0/1.5, 3.0/10.0, 3.0/10.0, 10, 1e-5, VECTOR_PROX_MAP[penalty], VECTOR_STOP_MAP[penalty])
+        _saga_vector_scaling(X, y, 3.0/10.0, 3.0/10.0, 10, 1e-5, VECTOR_PROX_MAP[penalty], VECTOR_STOP_MAP[penalty])
