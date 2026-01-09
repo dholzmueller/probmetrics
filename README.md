@@ -54,7 +54,7 @@ These are the main supported methods:
   We recommend using `'logistic'` for best results, 
   especially on multiclass problems. 
   It can be slow for larger numbers of classes. Only runs on CPU. 
-  For the (L-)BFGS version (not the default), 
+  For the SAGA version (not the default), 
   the first call is slower due to numba compilation.
 - `'svs'`: Structured vector scaling (SVS) for multiclass problems, 
   faster than SMS for multiclass while being almost as good in many cases.
@@ -174,7 +174,7 @@ While there are some classes for regression metrics, they are not implemented.
 
 ## Releases
 
-- v1.1.0 by @eugeneberta: Improvements to the SVS and SMS calibrators:
+- v1.1.0 by [@eugeneberta](https://github.com/eugeneberta): Improvements to the SVS and SMS calibrators:
   - logit pre-processing with `'ts-mix'` is now automatic, 
     and the global scaling parameter $\alpha$ is fixed to 1. This yields:
     - improved performance on our tabular and computer vision benchmarks 
@@ -183,18 +183,18 @@ While there are some classes for regression metrics, they are not implemented.
     - ability to compute the duality gap in closed form for stopping SAGA solvers, 
       which we implement in this version.
   - improved L-BFGS solvers, much faster than in the previous version. 
-    Now the solver for default SVS and SMS.
+    Now used in SVS and SMS by default.
   - the default binary calibrator in `LogisticCalibrator` is now quadratic scaling 
     instead of affine scaling, this can be changed back by using 
     `LogisticCalibrator(binary_type='affine')`.
-- v1.0.0 by @eugeneberta: New post-hoc calibrators like `'logistic'` 
+- v1.0.0 by [@eugeneberta](https://github.com/eugeneberta): New post-hoc calibrators like `'logistic'` 
   including structured matrix scaling (SMS), 
   structured vector scaling (SVS), 
   affine scaling, and quadratic scaling.
-- v0.0.2 by @dholzmueller:
+- v0.0.2 by [@dholzmueller](https://github.com/dholzmueller):
   - Removed numpy<2.0 constraint
   - allow 1D vectors in CategoricalLogits / CategoricalProbs
   - add TorchCal temperature scaling
   - minor fixes in AutoGluon temperature scaling 
     that shouldn't affect the performance in practice
-- v0.0.1 by @dholzmueller: Initial release
+- v0.0.1 by [@dholzmueller](https://github.com/dholzmueller): Initial release
