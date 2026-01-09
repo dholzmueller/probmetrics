@@ -50,15 +50,16 @@ calib = get_calibrator('logistic')
 
 These are the main supported methods:
 - `'logistic'` defaults to structured matrix scaling (SMS) for multiclass 
-  and affine scaling for binary calibration. 
+  and quadratic scaling for binary calibration. 
   We recommend using `'logistic'` for best results, 
   especially on multiclass problems. 
   It can be slow for larger numbers of classes. Only runs on CPU. 
-  The first call is slower due to numba compilation.
+  For the (L-)BFGS version (not the default), 
+  the first call is slower due to numba compilation.
 - `'svs'`: Structured vector scaling (SVS) for multiclass problems, 
   faster than SMS for multiclass while being almost as good in many cases.
-- `'quadratic-scaling'`: Quadratic scaling for binary problems, 
-  outperforms `'logistic'` (affine scaling) in our benchmarks.
+- `'affine-scaling'`: Affine scaling for binary problems, 
+  underperforms `'logistic'` (quadratic scaling) in our benchmarks but preserves AUC.
 - `'temp-scaling'`: Our 
   [highly efficient implementation of temperature scaling](https://arxiv.org/abs/2501.19195)
   that, unlike some other implementations, 
@@ -173,21 +174,27 @@ While there are some classes for regression metrics, they are not implemented.
 
 ## Releases
 
-- v1.1.0: Improvements to the SVS and SMS calibrators:
-  - logit pre-processing with `'ts-mix'` is now automatic, and the global scaling parameter $\alpha$ is fixed to 1. This yields:
-    - improved performance on our tabular and computer vision benchmarks (see the arxiv v2 of the SMS paper, coming soon).
+- v1.1.0 by @eugeneberta: Improvements to the SVS and SMS calibrators:
+  - logit pre-processing with `'ts-mix'` is now automatic, 
+    and the global scaling parameter $\alpha$ is fixed to 1. This yields:
+    - improved performance on our tabular and computer vision benchmarks 
+      (see the arxiv v2 of the SMS paper, coming soon).
     - faster convergence.
-    - ability to compute the duality gap in closed form for stopping SAGA solvers, which we implement in this version.
-  - improved L-BFGS solvers, much faster than in the previous version. Now the solver for default SVS and SMS.
-  - the default binary calibrator in `LogisticCalibrator` is now quadratic-scaling instead of affine scaling.
-- v1.0.0: New post-hoc calibrators like `'logistic'` 
+    - ability to compute the duality gap in closed form for stopping SAGA solvers, 
+      which we implement in this version.
+  - improved L-BFGS solvers, much faster than in the previous version. 
+    Now the solver for default SVS and SMS.
+  - the default binary calibrator in `LogisticCalibrator` is now quadratic scaling 
+    instead of affine scaling, this can be changed back by using 
+    `LogisticCalibrator(binary_type='affine')`.
+- v1.0.0 by @eugeneberta: New post-hoc calibrators like `'logistic'` 
   including structured matrix scaling (SMS), 
   structured vector scaling (SVS), 
   affine scaling, and quadratic scaling.
-- v0.0.2:
+- v0.0.2 by @dholzmueller:
   - Removed numpy<2.0 constraint
   - allow 1D vectors in CategoricalLogits / CategoricalProbs
   - add TorchCal temperature scaling
   - minor fixes in AutoGluon temperature scaling 
     that shouldn't affect the performance in practice
-- v0.0.1: Initial release
+- v0.0.1 by @dholzmueller: Initial release

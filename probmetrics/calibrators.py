@@ -1656,7 +1656,7 @@ def get_calibrator(
             tol=config.get("sms_tol", 1e-5),
             print_init_info=config.get("sms_print_init_info", True),
         )
-    elif calibration_method == "logistic":
+    elif calibration_method in ["logistic", "logistic-mix"]:
         cal = LogisticCalibrator(
             binary_type=config.get("logistic_binary_type", "affine"),
             multiclass_type=config.get("logistic_multiclass_type", "sms"),
