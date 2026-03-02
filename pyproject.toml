@@ -27,8 +27,6 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "numpy>=1.25",
-    # scikit-learn==1.8 will deprecate the cv='prefit' option in CalibratedClassifierCV,
-    # for which the suggested solution doesn't work at the moment in case of missing classes
     "scikit-learn>=1.3",
     # older versions of torchmetrics (<1.2.1) have a bug that makes certain metrics slow:
     # https://github.com/Lightning-AI/torchmetrics/pull/2184
@@ -44,7 +42,10 @@ extra = [
     "relplot", # for smooth ECE
     "pytorch-minimize", # for torchcal TS implementation
     # relplot fails for sklearn 1.7: ModuleNotFoundError: No module named 'sklearn.utils._estimator_html_repr'
-    "scikit-learn>=1.3,<1.7",
+    "scikit-learn>=1.3",
+    "catboost", # For the WS_CatboostClassifier
+    "lightgbm", # For the WS_LGBMClassifier
+    "scipy",    # For the WS_LGBMClassifier to handle softmax 
 ]
 dev = [
     "matplotlib>=3.0", # plotting

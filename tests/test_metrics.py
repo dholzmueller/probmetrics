@@ -48,9 +48,9 @@ def test_metrics_equal(metrics: List[Metric], calib_dataset: Tuple[np.ndarray, n
         ['logloss', 'brier', 'accuracy', 'class-error', 'auroc-ovr', 'auroc-ovr-sklearn', 'auroc-ovo-sklearn',
          'logloss-clip1e-06', 'smece', 'ece-15', 'rmsce-15', 'mce-15',
          'mpn_logloss', 'mpn_brier', 'mpn_accuracy']),
-    MetricsWithCalibration(Metrics.from_names(['logloss', 'brier', 'accuracy', 'class-error']),
+    MetricsWithCalibration(Metrics.from_names(['logloss', 'brier', 'accuracy', 'class-error', 'proper-L2', 'proper-Linf']),
                            calibrator=get_calibrator('temp-scaling'), val_splitter=CVSplitter(n_cv=5)),
-    MetricsWithCalibration(Metrics.from_names(['logloss', 'brier', 'accuracy', 'class-error']),
+    MetricsWithCalibration(Metrics.from_names(['logloss', 'brier', 'accuracy', 'class-error', 'proper-L2', 'proper-Linf']),
                            calibrator=get_calibrator('temp-scaling'), val_splitter=AllSplitter()),
 ])
 def test_metrics_names(metrics: Metrics, calib_dataset: Tuple[np.ndarray, np.ndarray]):
