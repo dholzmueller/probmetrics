@@ -72,12 +72,15 @@ path = "probmetrics/__about__.py"
 installer = "uv"
 features = ["extra", "dev"]
 
-[tool.hatch.envs.hatch-test]
+[tool.hatch.envs.test]
 installer = "uv"
 features = ["extra", "dev"]
 
-[[tool.hatch.envs.hatch-test.matrix]]
-python = ["3.12", "3.11", "3.10", "3.9"]
+[tool.hatch.envs.test.scripts]
+run-tests = "pytest {args}"
+
+[[tool.hatch.envs.test.matrix]]
+python = ["3.9", "3.10", "3.11", "3.12"]
 
 [tool.hatch.build.targets.sdist]
 package = ['probmetrics']
