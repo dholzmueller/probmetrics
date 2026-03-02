@@ -31,7 +31,8 @@ dependencies = [
     # older versions of torchmetrics (<1.2.1) have a bug that makes certain metrics slow:
     # https://github.com/Lightning-AI/torchmetrics/pull/2184
     "torchmetrics>=1.2.1",
-    "numba>=0.59.0",
+    "numba<0.61; python_version < '3.10'",
+    "numba>=0.61; python_version >= '3.10'",
 ]
 
 [project.optional-dependencies]
