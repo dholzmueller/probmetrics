@@ -36,5 +36,5 @@ jobs:
       - name: Install swig
         run: uv pip install --system swig
       - name: Run tests
-        run: hatch -vvv run pytest -vv
-        timeout-minutes: 20
+        run: hatch -vv run pytest -vv
+        timeout-minutes: 3

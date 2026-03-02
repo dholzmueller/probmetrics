@@ -449,7 +449,7 @@ class LogLoss(ClassificationMetric):
         torch.Tensor]:
         logits = y_pred.get_logits()
         if not self.binary_as_multiclass:
-            raise NotImplementedError("This class does not suppoer binary_as_multiclass yet.")
+            raise NotImplementedError("This class does not support binary_as_multiclass=False yet.")
         if y_true.is_dirac():
             return -F.log_softmax(logits, dim=-1).gather(-1, y_true.get_modes().unsqueeze(-1)).squeeze(-1)
         else:
@@ -464,10 +464,11 @@ class ClippedLogLoss(ClassificationMetric):
     def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         if not self.binary_as_multiclass:
-            raise NotImplementedError("This class does not suppoer binary_as_multiclass yet.")
+            raise NotImplementedError("This class does not support binary_as_multiclass yet.")
         probs = y_pred.get_probs()
         probs = probs.clamp(min=self.clip_threshold, max=1.0)
         probs = probs / probs.sum(dim=-1, keepdim=True)
+        return LogLoss().compute(y_true, CategoricalProbs(probs))
         log_probs = torch.log(probs)
         if y_true.is_dirac():
             return -log_probs.gather(-1, y_true.get_modes().unsqueeze(-1)).squeeze(-1)
