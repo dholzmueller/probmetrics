@@ -30,7 +30,7 @@ jobs:
           # Install a specific version of uv.
           version: "0.5.4"
       - name: Install hatch
-        run: uv pip install --system hatch
+        run: python -m pip install -U pip hatch
       - name: Install swig
         run: uv pip install --system swig
       - name: Run tests
