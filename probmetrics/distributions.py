@@ -106,13 +106,16 @@ class CategoricalLogits(CategoricalDistribution):
     # or even more versions for different link functions?
     def __init__(self, logits: torch.Tensor):
         """
-        :param logits: Logits of shape (n_samples, n_classes) or (n_samples,).
-            In the latter case, logits are interpreted as binary logits
+        :param logits: Logits of shape (n_samples, n_classes) or (n_samples,) or (n_samples, 1).
+            In the latter two cases, logits are interpreted as binary logits
             such that sigmoid(logits) is the probability for class 1.
             They will be converted to (n_samples, 2) shaped logits.
         """
         if len(logits.shape) == 1:
             logits = torch.stack([torch.zeros_like(logits), logits], dim=1)
+        elif logits.shape[1] == 1:
+            logits = torch.cat([torch.zeros_like(logits), logits], dim=1)
+        assert logits.ndim == 2
         self.logits = logits
         self.probs = None
         self.modes = None
@@ -149,12 +152,15 @@ class CategoricalProbs(CategoricalDistribution):
     # or even more versions for different link functions?
     def __init__(self, probs: torch.Tensor):
         """
-        :param probs: Probabilities of shape (n_samples, n_classes) or (n_samples,).
-            In the latter case, the vector is interpreted as probabilities for class 1.
+        :param probs: Probabilities of shape (n_samples, n_classes) or (n_samples,) or (n_samples, 1).
+            In the latter two cases, the vector is interpreted as probabilities for class 1.
             It will then be converted to a (n_samples, 2) shaped vector.
         """
         if len(probs.shape) == 1:
             probs = torch.stack([1.-probs, probs], dim=1)
+        elif probs.shape[-1] == 1:
+            probs = torch.cat([1.-probs, probs], dim=1)
+        assert probs.ndim == 2
         self.logits = None
         self.probs = probs
         self.modes = None

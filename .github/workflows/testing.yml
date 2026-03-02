@@ -30,11 +30,11 @@ jobs:
           # Install a specific version of uv.
           version: "0.5.4"
       - name: Install hatch
-        run: uv pip install --system hatch
+        run: uv pip install --system hatch "virtualenv<21"
       - name: Install swig
         run: uv pip install --system swig
       - name: Run tests
-        run: hatch test
+        run: hatch run pytest
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v4.5.0
         with:

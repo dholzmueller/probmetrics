@@ -6,6 +6,7 @@ import sklearn
 import logging
 import torchmin
 import numpy as np
+
 from probmetrics.saga import (
     fit_affine_scaling,
     warm_up_affine_scaling,
@@ -17,6 +18,7 @@ from probmetrics.saga import (
     warm_up_matrix_scaling,
 )
 from probmetrics.utils import (
+    process_binary_probs,
     binary_probs_to_logits,
     multiclass_probs_to_logits,
     validate_probabilities,
@@ -24,6 +26,8 @@ from probmetrics.utils import (
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+
 from torch import nn
 
 from probmetrics.distributions import (
@@ -255,7 +259,7 @@ class BinaryLogisticCalibrator(Calibrator):
     - 'quadratic': calibrated_logit = b + w1 * logit + w2 * logit^2
     """
 
-    VALID_TYPES = ["linear", "affine", "quadratic"]
+    VALID_TYPES = ["linear", "affine", "quadratic", "beta"]
 
     def __init__(self, type: str = "affine"):
         """
@@ -274,21 +278,32 @@ class BinaryLogisticCalibrator(Calibrator):
         self.cal_ = None
 
     def _get_logits(self, X: np.ndarray) -> np.ndarray:
-        logits = binary_probs_to_logits(X)
-        logits = logits.reshape(-1, 1)
+        log_p, log_1_minus_p = binary_probs_to_logits(X)
+        logits = log_p - log_1_minus_p
+        
+        if self.type == "linear":
+            return logits
+        
+        ones = np.ones_like(logits)
+        
         if self.type == "affine":
-            # Adding a constant term to logit vectors.
-            logits = np.hstack([np.ones((len(X), 1)), logits])
+            return np.hstack([ones, logits])
+        
         elif self.type == "quadratic":
-            # Adding a constant and quadratic term to logit vectors.
-            logits = np.hstack([np.ones((len(X), 1)), logits, np.square(logits)])
-        return logits
+            return np.hstack([ones, logits, np.square(logits)])
+        
+        if self.type == "beta": # TODO Check that this is indeed beta
+            return np.hstack([ones, log_p, log_1_minus_p])
 
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         """Fits the logistic regression calibrator."""
         from sklearn.linear_model import LogisticRegression
 
-        self.cal_ = LogisticRegression(penalty=None, fit_intercept=False)
+        self.cal_ = LogisticRegression(
+            penalty=None,
+            fit_intercept=False,
+            solver="lbfgs"
+        )
 
         features = self._get_logits(X)
         self.cal_.fit(features, y)
@@ -304,7 +319,7 @@ class BinaryLogisticCalibrator(Calibrator):
         return self.cal_.predict_proba(features)
 
 
-class AffineScalingCalibrator(Calibrator):
+class RegularizedAffineScalingCalibrator(Calibrator):
     """
     Binary post-hoc calibration with Platt scaling (~binary logistic regression) $sigmoid(ax+b)$ on the logits x.
     Uses the SAGA algorithm to fit the scaling and intercept parameters a & b.
@@ -332,22 +347,21 @@ class AffineScalingCalibrator(Calibrator):
 
         self.w = None
 
-        if not AffineScalingCalibrator._warmed_up:
+        if not RegularizedAffineScalingCalibrator._warmed_up:
             if self.print_init_info:
                 print(
-                    "First AffineScalingCalibrator instantiation - warming up Numba functions..."
+                    "First RegularizedAffineScalingCalibrator instantiation - warming up Numba functions..."
                 )
             warm_up_affine_scaling()
-            AffineScalingCalibrator._warmed_up = True
+            RegularizedAffineScalingCalibrator._warmed_up = True
             if self.print_init_info:
                 print("Warmed up!")
 
     def _get_logits(self, X: np.ndarray) -> np.ndarray:
-        logits = binary_probs_to_logits(X)
-        logits = logits.reshape(-1, 1)
-        # Adding a constant term to logit vectors to fit the intercept b.
-        logits = np.hstack([np.ones((len(X), 1)), logits])
-        return logits
+        log_p, log_1_minus_p = binary_probs_to_logits(X)
+        logits = log_p - log_1_minus_p
+        ones = np.ones_like(logits)
+        return np.hstack([ones, logits])
 
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         logits = self._get_logits(X)
@@ -372,7 +386,7 @@ class AffineScalingCalibrator(Calibrator):
         return np.hstack([1 - probs, probs])
 
 
-class QuadraticScalingCalibrator(Calibrator):
+class RegularizedQuadraticScalingCalibrator(Calibrator):
     """
     Binary post-hoc calibration with quadratic scaling $sigmoid(a + bx + cx^2)$ on the logits x.
     Uses the SAGA algorithm to fit the intercept, scaling and quadratic parameters a, b & c.
@@ -403,22 +417,21 @@ class QuadraticScalingCalibrator(Calibrator):
 
         self.w = None
 
-        if not QuadraticScalingCalibrator._warmed_up:
+        if not RegularizedQuadraticScalingCalibrator._warmed_up:
             if self.print_init_info:
                 print(
-                    "First QuadraticScalingCalibrator instantiation - warming up Numba functions..."
+                    "First RegularizedQuadraticScalingCalibrator instantiation - warming up Numba functions..."
                 )
             warm_up_quadratic_scaling()
-            QuadraticScalingCalibrator._warmed_up = True
+            RegularizedQuadraticScalingCalibrator._warmed_up = True
             if self.print_init_info:
                 print("Warmed up!")
 
     def _get_logits(self, X: np.ndarray) -> np.ndarray:
-        logits = binary_probs_to_logits(X)
-        logits = logits.reshape(-1, 1)
-        # Adding a constant and quadratic term to logit vectors.
-        logits = np.hstack([np.ones((len(X), 1)), logits, np.square(logits)])
-        return logits
+        log_p, log_1_minus_p = binary_probs_to_logits(X)
+        logits = log_p - log_1_minus_p
+        ones = np.ones_like(logits)
+        return np.hstack([ones, logits, np.square(logits)])
 
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         logits = self._get_logits(X)
@@ -1051,16 +1064,92 @@ class TorchUncertaintyTemperatureScalingCalibrator(TemperatureScalingCalibrator)
         self.lr = lr
         self.max_iter = max_iter
 
+class TabPFNCalibrator(Calibrator):
+    def __init__(self):
+        super().__init__()
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        from tabpfn import TabPFNClassifier
+        
+        self.cal_ = TabPFNClassifier()
+        
+        probs = process_binary_probs(X)
+
+        self.cal_.fit(probs.reshape(-1,1), y)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        
+        probs = process_binary_probs(X)
+
+        result = self.cal_.predict_proba(probs.reshape(-1,1))
+        if len(result.shape) == 1:
+            return np.stack([1.0 - result, result], axis=1)
+        elif result.shape[1] == 1:
+            return np.concatenate([1.0 - result, result], axis=1)
+
+        return result
+
+class BetacalCalibrator(Calibrator):
+    # From https://github.com/betacal/python/
+    def __init__(self, parameters="abm"):
+        super().__init__()
+        
+        from betacal import BetaCalibration
+        
+        self.cal_ = BetaCalibration(parameters=parameters)
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        probs = process_binary_probs(X)
+        
+        self.cal_.fit(probs, y)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        probs = process_binary_probs(X)
+        
+        result = self.cal_.predict(probs)
+        
+        if len(result.shape) == 1:
+            return np.stack([1.0 - result, result], axis=1)
+        elif result.shape[1] == 1:
+            return np.concatenate([1.0 - result, result], axis=1)
+
+        return result
+    
+class MLISplineCalibrator(Calibrator):
+    # From https://github.com/numeristical/introspective
+    def __init__(self):
+        super().__init__()
+
+        from ml_insights import SplineCalib
+
+        self.cal_ = SplineCalib()
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        probs = process_binary_probs(X)
+        
+        self.cal_.fit(probs, y)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        probs = process_binary_probs(X)
+
+        result = self.cal_.calibrate(probs)
+        
+        if len(result.shape) == 1:
+            return np.stack([1.0 - result, result], axis=1)
+        elif result.shape[1] == 1:
+            return np.concatenate([1.0 - result, result], axis=1)
+
+        return result
 
 class NetcalTemperatureScalingCalibrator(Calibrator):
     # this one does nothing due to https://github.com/EFS-OpenSource/calibration-framework/issues/61
     def __init__(self):
         super().__init__()
-
-    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         from netcal.scaling import TemperatureScaling
 
         self.cal_ = TemperatureScaling()
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         if X.shape[1] == 2:
             # binary, convert
             X = X[:, 1]
@@ -1200,42 +1289,55 @@ class TorchcalMatrixScalingCalibrator(Calibrator):
 
 
 class CenteredIsotonicRegressionCalibrator(Calibrator):
+    def __init__(self):
+        super().__init__()
+
+        from cir_model import CenteredIsotonicRegression
+
+        self.cal_ = CenteredIsotonicRegression()
+
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
-        assert not np.any(np.isnan(X))
-        # print(f'{np.unique(y)=}')
-        # print(f'{np.unique(X)=}')
+        # TODO
         # we have to use float64 since with float32 it can happen that somewhere internally
         # a rounding error occurs (?) and interp1d thinks that it is asked to extrapolate at the boundary value,
         # which causes it to output nan values,
         # which are seen as a separate possible value but (y==value) is empty because nan==nan is false,
         # so an error occurs because the method attempts to take an average of an empty set
-        X = X.astype(np.float64)
-        y = y.astype(np.float64)
-        from cir_model import CenteredIsotonicRegression
 
-        self.cal_ = CenteredIsotonicRegression()
-        self.cal_.fit(X[:, 1], y)
-        self.min_ = np.min(X[:, 1])
-        self.max_ = np.max(X[:, 1])
+        probs = process_binary_probs(X)
+
+        probs = probs.astype(np.float64)
+        y = y.astype(np.float64)
+
+        self.cal_.fit(probs, y)
+        self.min_ = np.min(probs)
+        self.max_ = np.max(probs)
 
     def predict_proba(self, X):
+        probs = process_binary_probs(X)
+        probs = probs.astype(np.float64)
+
         # have to clip since CenteredIsotonicRegression refuses to extrapolate (?)
-        X = X.astype(np.float64)
-        X = np.clip(X, self.min_, self.max_)
-        pred_probs = self.cal_.transform(X[:, 1])
-        pred_probs = np.clip(pred_probs, 0.0, 1.0)
-        return np.stack([1.0 - pred_probs, pred_probs], axis=-1)
+        probs = np.clip(probs, self.min_, self.max_)
+        
+        result = self.cal_.transform(probs)
+        result = np.clip(result, 0.0, 1.0)
+        return np.stack([1.0 - result, result], axis=-1)
 
 
 class BinaryVennAbersCalibrator(Calibrator):
-    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+    def __init__(self):
+        super().__init__()
+
         from venn_abers import VennAbers
 
-        self.va_ = VennAbers()
-        self.va_.fit(X, y)
+        self.cal_ = VennAbers()
+
+    def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
+        self.cal_.fit(X, y)
 
     def predict_proba(self, X):
-        return self.va_.predict_proba(X)[0]
+        return self.cal_.predict_proba(X)[0]
 
 
 class VennAbersCalibrator(Calibrator):
@@ -1439,36 +1541,79 @@ class PreprocessingCalibratorWrapper(Calibrator):
 
 
 class SklearnCalibrator(Calibrator):
-    def __init__(self, method: str, cv: str):
+    def __init__(self, method: str, cv: str = "prefit"):
+        assert cv == 'prefit', "Other methods than prefit not intended and not implemented for sklearn > 1.6"
         super().__init__()
         self.method = method
         self.cv = cv
+
+    @staticmethod
+    def _normalize_rows(A: np.ndarray) -> np.ndarray:
+        """Row-normalize so rows sum to 1; safe if a row sums to 0."""
+        s = A.sum(axis=1, keepdims=True)
+        s = np.where(s == 0.0, 1.0, s)
+        return A / s
 
     def _fit_impl(self, X: np.ndarray, y: np.ndarray) -> None:
         if X.ndim == 1:
             X = np.stack((1.0 - X, X), axis=1)
 
-        n_classes = X.shape[-1]
-        est = IdentityEstimator(n_classes)
-        est.fit(X, y)
+        y = np.asarray(y)
 
-        # tried this workaround for deprecation warnings, but it complains in case of missing classes because it still tries to fit the estimator
-        # try:
-        #     # cv='prefit' option is deprecated from sklearn 1.6, FrozenEstimator was introduced in sklearn 1.6
-        #     from sklearn.frozen import FrozenEstimator
-        #     self.calib_ = CalibratedClassifierCV(FrozenEstimator(est), method=self.method, cv=[(np.arange(0), np.arange(X.shape[0]))])
-        # except ImportError:
-        #     self.calib_ = CalibratedClassifierCV(est, method=self.method, cv=self.cv)
+        self.n_classes_ = X.shape[-1]
+        self.classes_ = np.arange(self.n_classes_)
 
-        self.calib_ = CalibratedClassifierCV(est, method=self.method, cv=self.cv)
-        self.calib_.fit(X, y)
-        self.classes_ = est.classes_
+        # Fit label encoder up-front (used for the missing-class path)
+        self.label_encoder_ = LabelEncoder()
+        y_mapped = self.label_encoder_.fit_transform(y)
+        self.present_classes_ = self.label_encoder_.classes_
+        self.missing_classes_ = np.setdiff1d(self.classes_, self.present_classes_)
 
-    def predict_proba(self, X):
+        # ---------- Case 1: no missing classes -> original formulation ----------
+        if self.missing_classes_.size == 0:
+            est = IdentityEstimator(self.n_classes_)
+            est.fit(X, y)
+
+            try:
+                # sklearn >= 1.6
+                from sklearn.frozen import FrozenEstimator
+                self.calib_ = CalibratedClassifierCV(FrozenEstimator(est), method=self.method)
+            except ImportError:
+                # sklearn < 1.6
+                self.calib_ = CalibratedClassifierCV(est, method=self.method, cv=self.cv)
+
+            self.calib_.fit(X, y)
+            return
+
+        # ---------- Case 2: missing classes -> slice + normalize X_present, use y_mapped ----------
+        X_present = self._normalize_rows(X[:, self.present_classes_])
+
+        est = IdentityEstimator(len(self.present_classes_))
+        est.fit(X_present, y_mapped)
+
+        try:
+            from sklearn.frozen import FrozenEstimator
+            self.calib_ = CalibratedClassifierCV(FrozenEstimator(est), method=self.method)
+        except ImportError:
+            self.calib_ = CalibratedClassifierCV(est, method=self.method, cv=self.cv)
+
+        self.calib_.fit(X_present, y_mapped)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if X.ndim == 1:
             X = np.stack((1.0 - X, X), axis=1)
 
-        return self.calib_.predict_proba(X)
+        # If fit saw all classes, keep original behavior
+        if self.missing_classes_.size == 0:
+            return self.calib_.predict_proba(X)
+
+        # Missing classes: normalize the same sliced X_present and zero-fill missing classes (Option A)
+        X_present = self._normalize_rows(X[:, self.present_classes_])
+        p_present = self.calib_.predict_proba(X_present)
+
+        p_full = np.zeros((X.shape[0], self.n_classes_), dtype=p_present.dtype)
+        p_full[:, self.present_classes_] = p_present
+        return p_full
 
 
 class WrapCalibratorAsClassifier(BaseEstimator, ClassifierMixin):
@@ -1631,6 +1776,10 @@ def get_calibrator(
         cal = BinaryLogisticCalibrator(type="affine")
     elif calibration_method == "quadratic-scaling":
         cal = BinaryLogisticCalibrator(type="quadratic")
+    elif calibration_method == "beta":
+        cal = BetacalCalibrator(
+            parameters=config.get("beta_parameters", "abm")
+        )
     elif calibration_method == "svs":
         cal = SVSCalibrator(
             penalty=config.get("svs_penalty", "ridge"),

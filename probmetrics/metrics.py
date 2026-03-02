@@ -1,16 +1,19 @@
-from typing import Optional, Dict, List, Callable, Literal
+from collections import Counter
+from typing import Optional, Dict, List, Callable, Literal, Union
 
 import sklearn
+import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
 from probmetrics import utils
-from probmetrics.calibrators import Calibrator, TemperatureScalingCalibrator, get_calibrator
+from probmetrics.calibrators import Calibrator, get_calibrator
 from probmetrics.distributions import Distribution, CategoricalDistribution, ContinuousDistribution, CategoricalProbs, \
     CategoricalDirac, CategoricalLogits
 from probmetrics.splitters import Splitter, CVSplitter, AllSplitter
 from probmetrics.torch_utils import remove_missing_classes
+from probmetrics.classifiers import WS_CatboostClassifier
 
 
 class MetricType:
@@ -35,11 +38,14 @@ class MetricType:
 
 class Metrics:
     # todo: type-hinting for enum type?
-    def __init__(self, names: List[str], is_lower_better_list: List[bool], metric_type: str):
+    def __init__(self, names: List[str], is_lower_better_list: List[bool], metric_type: str, requires_f_x: bool = False,
+                 binary_as_multiclass: bool = True):
         assert len(names) == len(is_lower_better_list)
         self.names = names
         self.is_lower_better_list = is_lower_better_list
         self.metric_type = metric_type
+        self.requires_f_x = requires_f_x
+        self.binary_as_multiclass = binary_as_multiclass
 
     def get_metric_type(self) -> str:
         return self.metric_type
@@ -49,7 +55,7 @@ class Metrics:
 
     def compute_all(self, y_true: Distribution, y_pred: Distribution,
                     other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                    weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                    weights: Optional[torch.Tensor] = None, f_x: Optional[Distribution] = None) -> Dict[str, torch.Tensor]:
         """
         Compute the metrics values. Should be overridden by subclasses.
 
@@ -62,6 +68,7 @@ class Metrics:
         Note that the option 'none' is not supported by all subclasses.
         :param weights: (Optional) sample weights of shape (n_samples,). Can only be used with 'mean' reduction.
         Weights are not implemented by all subclasses.
+        :param f_x: Values f(x) for calibration-related proper losses (these can be sample-dependent).
         :return:
         """
         raise NotImplementedError()
@@ -91,10 +98,21 @@ class Metrics:
 
     @staticmethod
     def _get_candidate_metrics() -> List['Metrics']:
-        proper_metrics = CombinedMetrics([LogLoss(), BrierLoss(), ClippedLogLoss()])
+        proper_metrics = CombinedMetrics([LogLoss(), BrierLoss(), ClippedLogLoss(),
+                                          ProperLpLoss(p=1), ProperLpLoss(p=2), ProperLpLoss(p=float('inf'))])
         cand_list = [ClassError(), Accuracy(), LogLoss(), BrierLoss(), ClippedLogLoss(), AUROCOneVsRest(),
                      AUROCOneVsOneSklearn(), AUROCOneVsRestSklearn(), OneMinusAUROCOneVsRest(),
                      CalibrationError(norm='l1'), CalibrationError(norm='l2'), CalibrationError(norm='max'),
+                     ProperLpLoss(p=1), ProperLpLoss(p=2), ProperLpLoss(p=float('inf')),
+                     ProperLpLoss(p=1, binary_as_multiclass=True),
+                     ProperLpLoss(p=2, binary_as_multiclass=True),
+                     ProperLpLoss(p=float('inf'), binary_as_multiclass=True),
+                     TopClassLoss(UnderConfidenceLoss(ProperLpLoss(p=1))),
+                     TopClassLoss(OverConfidenceLoss(ProperLpLoss(p=1))),
+                     TopClassLoss(ProperLpLoss(p=1)),
+                     TopClassLoss(ProperLpLoss(p=2)),
+                     TopClassLoss(ProperLpLoss(p=float('inf'))),
+                     BrierLoss(binary_as_multiclass=False),
                      SmoothCalibrationError(),
                      MSE(), RMSE(), NRMSE(), MAE(), NMAE()]
         cand_list.extend([MeanProbNormalizedMetric(metric) for metric in
@@ -108,6 +126,10 @@ class Metrics:
                 MetricsWithCalibration(proper_metrics,
                                        get_calibrator('isotonic', calibrate_with_mixture=True),
                                        val_splitter=splitter, cal_name='isotonic-mix',
+                                       random_state=0),
+                MetricsWithCalibration(proper_metrics,
+                                       WS_CatboostClassifier(),
+                                       val_splitter=splitter,
                                        random_state=0),
             ])
 
@@ -162,6 +184,13 @@ class CombinedMetrics(Metrics):
             zip_dict = {n: i for n, i in zip(names, is_lower_better)}
             names = used_metric_names
             is_lower_better = [zip_dict[name] for name in names]
+
+        # check for duplicates in the names
+        counts = Counter(names)
+        duplicates = [item for item, count in counts.items() if count > 1]
+        if duplicates:
+            raise ValueError(f"Multiple metrics generate results with the same name, duplicate names are: {duplicates}")
+
         super().__init__(names=names,
                          is_lower_better_list=is_lower_better,
                          metric_type=metrics_list[0].metric_type
@@ -170,19 +199,22 @@ class CombinedMetrics(Metrics):
 
     def compute_all(self, y_true: Distribution, y_pred: Distribution,
                     other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                    weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        metric_values = other_metric_values or dict()
+                    weights: Optional[torch.Tensor] = None, f_x: Optional[Distribution] = None) -> Dict[str, torch.Tensor]:
+        metric_values = dict()
+        other_metric_values = dict() if other_metric_values is None else other_metric_values
 
         for metrics in self.metrics_list:
-            results = metrics.compute_all(y_true, y_pred, metric_values, reduction, weights)
+            results = metrics.compute_all(y_true, y_pred, metric_values, reduction, weights, f_x=f_x)
             metric_values = utils.join_dicts(metric_values, results, allow_overlap=False)
+            other_metric_values = utils.join_dicts(other_metric_values, results)  # here we can have overlap
 
         return {key: value for key, value in metric_values.items() if key in self.get_names()}
 
 
 class Metric(Metrics):
-    def __init__(self, name: str, is_lower_better: bool, metric_type: str):
-        super().__init__(names=[name], is_lower_better_list=[is_lower_better], metric_type=metric_type)
+    def __init__(self, name: str, is_lower_better: bool, metric_type: str, requires_f_x: bool = False, binary_as_multiclass:bool = True):
+        name = name if binary_as_multiclass else name+"-binary-as-1d"
+        super().__init__(names=[name], is_lower_better_list=[is_lower_better], metric_type=metric_type, requires_f_x=requires_f_x, binary_as_multiclass=binary_as_multiclass)
         self.name = name
         self.is_lower_better = is_lower_better
 
@@ -194,8 +226,8 @@ class Metric(Metrics):
 
     def compute_all(self, y_true: Distribution, y_pred: Distribution,
                     other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                    weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        return {self.get_name(): self.compute(y_true, y_pred, other_metric_values, reduction, weights)}
+                    weights: Optional[torch.Tensor] = None, f_x: Optional[Distribution] = None) -> Dict[str, torch.Tensor]:
+        return {self.get_name(): self.compute(y_true, y_pred, other_metric_values, reduction, weights, f_x=f_x)}
 
     # may have parameters  (e.g., quantile_alpha, or bin distribution for regression-as-classification)
     # alternative computations?
@@ -203,7 +235,7 @@ class Metric(Metrics):
     # batched computation?
     def compute(self, y_true: Distribution, y_pred: Distribution,
                 other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                weights: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         # maybe use kwargs?
         # or have other functions for compute() and compute with other metric values?
         # maybe with the reduction we have the possibility to compute confidence intervals as well?
@@ -233,17 +265,18 @@ class SelectMetric(Metric):
 
     def compute(self, y_true: Distribution, y_pred: Distribution,
                 other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.metrics.compute_all(y_true, y_pred, other_metric_values, reduction, weights)[self.name]
+                weights: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        return self.metrics.compute_all(y_true, y_pred, other_metric_values, reduction, weights, **kwargs)[self.name]
 
 
 class ClassificationMetric(Metric):
-    def __init__(self, name: str, is_lower_better: bool):
-        super().__init__(name=name, is_lower_better=is_lower_better, metric_type=MetricType.CLASS)
+    def __init__(self, name: str, is_lower_better: bool, requires_f_x: bool = False, binary_as_multiclass: bool = True):
+        super().__init__(name=name, is_lower_better=is_lower_better, metric_type=MetricType.CLASS,
+                         requires_f_x=requires_f_x, binary_as_multiclass=binary_as_multiclass)
 
     def compute(self, y_true: Distribution, y_pred: Distribution,
                 other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                weights: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         if not isinstance(y_pred, CategoricalDistribution):
             raise ValueError(f'Classification metrics need a categorical distribution, but got {type(y_pred)=}')
         if not isinstance(y_true, CategoricalDistribution):
@@ -259,13 +292,13 @@ class ClassificationMetric(Metric):
                 if result is not None:
                     return result
 
-            result = self._compute_mean(y_true, y_pred)
+            result = self._compute_mean(y_true, y_pred, **kwargs)
             if result is None:
                 raise NotImplementedError()
 
             return result
         else:
-            result = self._compute_indiv(y_true, y_pred)
+            result = self._compute_indiv(y_true, y_pred, **kwargs)
             if result is None:
                 raise NotImplementedError()
             if reduction == 'mean':
@@ -290,7 +323,7 @@ class ClassificationMetric(Metric):
         """
         return None
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         """
         Compute a metric value for the entire dataset. By default, this tries to use _compute_indiv().
         Override this method if the metric doesn't support _compute_indiv().
@@ -298,10 +331,10 @@ class ClassificationMetric(Metric):
         :param y_pred:
         :return:
         """
-        indiv_results = self._compute_indiv(y_true, y_pred)
+        indiv_results = self._compute_indiv(y_true, y_pred, **kwargs)
         return None if indiv_results is None else indiv_results.mean(dim=-1)
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         """
         Compute metric values per sample. Override this method if applicable, else override _compute_mean().
@@ -319,7 +352,7 @@ class RegressionMetric(Metric):
 
     def compute(self, y_true: Distribution, y_pred: Distribution,
                 other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                weights: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         # todo: do we really want y_true to be a distribution here?
         # todo: what about the multi-output setting?
         if not isinstance(y_pred, ContinuousDistribution):
@@ -334,13 +367,13 @@ class RegressionMetric(Metric):
                 if result is not None:
                     return result
 
-            result = self._compute_mean(y_true, y_pred)
+            result = self._compute_mean(y_true, y_pred, **kwargs)
             if result is None:
                 raise NotImplementedError()
 
             return result
         else:
-            result = self._compute_indiv(y_true, y_pred)
+            result = self._compute_indiv(y_true, y_pred, **kwargs)
             if result is None:
                 raise NotImplementedError()
             if reduction == 'mean':
@@ -356,11 +389,11 @@ class RegressionMetric(Metric):
                         other_metric_values: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
         return None
 
-    def _compute_mean(self, y_true: ContinuousDistribution, y_pred: ContinuousDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: ContinuousDistribution, y_pred: ContinuousDistribution, **kwargs) -> Optional[torch.Tensor]:
         indiv_results = self._compute_indiv(y_true, y_pred)
         return None if indiv_results is None else indiv_results.mean(dim=-1)
 
-    def _compute_indiv(self, y_true: ContinuousDistribution, y_pred: ContinuousDistribution) -> Optional[
+    def _compute_indiv(self, y_true: ContinuousDistribution, y_pred: ContinuousDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         return None
 
@@ -388,7 +421,7 @@ class ClassError(ClassificationMetric):
             return 1 - other_metric_values['accuracy']
         return None
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         return (y_pred.get_modes() != y_true.get_modes()).to(torch.float32)
 
@@ -403,18 +436,20 @@ class Accuracy(ClassificationMetric):
             return 1 - other_metric_values['class-error']
         return None
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         return (y_pred.get_modes() == y_true.get_modes()).to(torch.float32)
 
 
 class LogLoss(ClassificationMetric):
     def __init__(self):
-        super().__init__(name='logloss', is_lower_better=True)
+        super().__init__(name='logloss', is_lower_better=True, binary_as_multiclass=True)
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
         logits = y_pred.get_logits()
+        if not self.binary_as_multiclass:
+            raise NotImplementedError("This class does not suppoer binary_as_multiclass yet.")
         if y_true.is_dirac():
             return -F.log_softmax(logits, dim=-1).gather(-1, y_true.get_modes().unsqueeze(-1)).squeeze(-1)
         else:
@@ -423,11 +458,13 @@ class LogLoss(ClassificationMetric):
 
 class ClippedLogLoss(ClassificationMetric):
     def __init__(self, clip_threshold: float = 1e-6):
-        super().__init__(name=f'logloss-clip{clip_threshold:g}', is_lower_better=True)
+        super().__init__(name=f'logloss-clip{clip_threshold:g}', is_lower_better=True, binary_as_multiclass=True)
         self.clip_threshold = clip_threshold
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
+        if not self.binary_as_multiclass:
+            raise NotImplementedError("This class does not suppoer binary_as_multiclass yet.")
         probs = y_pred.get_probs()
         probs = probs.clamp(min=self.clip_threshold, max=1.0)
         probs = probs / probs.sum(dim=-1, keepdim=True)
@@ -438,14 +475,286 @@ class ClippedLogLoss(ClassificationMetric):
             return (-log_probs * y_true.get_probs()).sum(dim=-1)
 
 
-class BrierLoss(ClassificationMetric):  # todo: also works as a regression metric
-    def __init__(self):
-        super().__init__(name='brier', is_lower_better=True)
+class BrierLoss(ClassificationMetric):
+    def __init__(self, binary_as_multiclass: bool = True):
+        """
+        Brier loss.
+        :param binary_as_multiclass: Whether to treat binary classification as a 2-dimensional multiclass problem
+            (yields twice the Brier score from 1D, which is also twice the value from scikit-learn).
+        """
+        super().__init__(name='brier', is_lower_better=True, binary_as_multiclass=binary_as_multiclass)
 
-    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
         torch.Tensor]:
-        # todo: adjust to sklearn?
+        if y_pred.get_n_classes() <= 2 and not self.binary_as_multiclass:
+            return (y_pred.get_probs()[:, 1] - y_true.get_probs()[:, 1]).square().sum(dim=-1)
         return (y_pred.get_probs() - y_true.get_probs()).square().sum(dim=-1)
+
+
+def _clip_p_values(p: torch.Tensor, f_x: torch.Tensor, for_over: bool = False, for_under: bool = False) -> torch.Tensor:
+    """    
+    Rectifies probabilities based on the reference point f_x.
+    
+    Logic for_under: 1_{f>0.5} * max(p,f) + 1_{f<0.5} * min(p,f) + 1_{f=0.5} * 0.5
+    Logic for_over:  1_{f>0.5} * min(p,f) + 1_{f<0.5} * max(p,f) + 1_{f=0.5} * 0.5
+
+    :param p: (Tensor) Predicted probability distribution.
+    :param f_x: (Tensor) Reference probability distribution.
+    :param for_over: (bool) Whether to clip for over-confidence.
+    :param for_under: (bool) Whether to clip for under-confidence.
+    """
+    if for_over and for_under:
+        raise ValueError("Both 'for_over' and 'for_under' cannot be True simultaneously.")
+    if not (for_over or for_under):
+        import warnings
+        msg = (
+            "Confidence clipping is initialized, but both 'for_over' and 'for_under' are set to False. "
+            "No values will be modified. Did you mean to enable one of these flags?"
+        )
+        warnings.warn(msg, category=UserWarning, stacklevel=2)
+
+    p = torch.as_tensor(p)
+    f_x = torch.as_tensor(f_x)
+
+    if p.shape[-1] != 1:
+        import warnings
+        msg = (
+            f"Input shape {p.shape} detected. Over/underconfidence metrics are "
+            "designed for binary tasks with shape (n, 1). For multi-class data, "
+            "consider using 'OverConfidenceLoss( TopClassLoss(DesiredMetric) )' or "
+            "OverConfidenceLoss( TopClassLoss(DesiredMetric) ) for confidence clipping."
+        )
+        warnings.warn(msg, UserWarning)
+    
+    clipped_p = torch.full_like(p, 0.5)
+
+    if for_under:
+        clipped_p = torch.where(f_x > 0.5, torch.maximum(p, f_x), clipped_p)
+        clipped_p = torch.where(f_x < 0.5, torch.minimum(p, f_x), clipped_p)
+        
+    elif for_over:
+        clipped_p = torch.where(f_x > 0.5, torch.minimum(p, f_x), clipped_p)
+        clipped_p = torch.where(f_x < 0.5, torch.maximum(p, f_x), clipped_p)
+
+    return clipped_p
+
+
+class ProperLpLoss(ClassificationMetric): 
+    def __init__(self, p: float = 2., binary_as_multiclass: bool = False):
+        assert p >= 1
+        super().__init__(name=f'proper-L{p:.10g}', is_lower_better=True, requires_f_x=True,
+                         binary_as_multiclass=binary_as_multiclass)
+        self.p = p
+
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[
+        torch.Tensor]:
+        """
+        Calculates the proper loss l_{f(X)}(g_f_x, Y) for a given norm.
+
+        Formula: l_{f(X)}(g, y) = h(g) + <subgradient, y - g>
+        where h(g) = -||g - f_x||_norm
+        g_f_x = y_pred
+        f_x is in kwargs
+        y = y_true
+        """
+        f_x = kwargs["f_x"].get_probs()  # values f(x) for calibration, that's where the loss is centered
+        y_pred_probs = y_pred.get_probs()
+        y_true_probs = y_true.get_probs()
+        if y_pred.get_n_classes() == 2 and not self.binary_as_multiclass:
+            y_pred_probs, y_true_probs = y_pred_probs[:, 1:], y_true_probs[:, 1:]
+
+        g_f_x = y_pred_probs
+        y = y_true_probs
+
+        diff = g_f_x - f_x
+        norm_val = torch.linalg.norm(diff, ord=self.p, dim=1, keepdim=True)
+        h_p = -norm_val.squeeze()
+
+        if self.p == float('inf'):
+            abs_diff = torch.abs(diff)
+            subgradient = torch.zeros_like(diff)
+            indices = torch.argmax(abs_diff, dim=1, keepdim=True)
+            subgradient.scatter_(1, indices, 1.0)
+            subgradient = -subgradient * torch.sign(diff)
+            dot_product = torch.sum(subgradient * (y - g_f_x), dim=1)
+            return dot_product + h_p
+
+        safe_norm = torch.where(norm_val == 0, torch.ones_like(norm_val), norm_val)
+        grad_norm = (torch.abs(diff) ** (self.p - 1) * torch.sign(diff)) / (safe_norm ** (self.p - 1))
+        subgradient = -torch.where(norm_val == 0, torch.zeros_like(grad_norm), grad_norm)
+        dot_product = torch.sum(subgradient * (y - g_f_x), dim=1)
+
+        return dot_product + h_p
+
+
+class TopClassLoss(ClassificationMetric):
+    def __init__(self, metric: Metrics):
+        """
+        Wrapper to calculate a given metric focusing only on the class 
+        where f(x) has the highest confidence and treating it as binary.
+        If f_x is provided, then f_x is used to determine the top class, otherwise y_pred is used.
+        
+        :param metric: An instantiated single Metric object.
+        """
+        if isinstance(metric, str):
+            raise TypeError("Expected a metric object, got a string. Use TopClassWrapper.from_name() instead.")
+        
+        if isinstance(metric, list) or metric.__class__.__name__ == 'CombinedMetrics':
+            raise ValueError("TopClassWrapper only supports a single metric object.")
+
+        self.base_metric = metric
+
+        base_name = self.base_metric.get_names()[0]
+        is_lower_better = self.base_metric.is_lower_better_list[0]
+        wrapper_name = f"topclass-{base_name}"        
+        
+        super().__init__(name=wrapper_name, is_lower_better=is_lower_better, requires_f_x=False)
+
+    @classmethod
+    def from_name(cls, metric_name: str) -> 'TopClassLoss':
+        """
+        Initialize the wrapper directly from a metric's string name.
+        """
+        base_metric = cls._resolve_single_metric(metric_name)
+        return cls(metric=base_metric)
+
+    @staticmethod
+    def _resolve_single_metric(name: str) -> Metrics:
+        """Helper to pull the specific base class out of candidates."""
+        return Metrics.from_names([name]).metrics_list[0]
+
+    def _extract_top_class(self, 
+                           y_true: CategoricalDistribution, 
+                           y_pred: CategoricalDistribution, 
+                           f_x: CategoricalDistribution):
+        """
+        Slices the distributions down to just the top class predicted by f_x.
+        Returns wrapped CategoricalProbs with two classes.
+        """
+        y_true_probs = y_true.get_probs()
+        y_pred_probs = y_pred.get_probs()
+        f_x_probs = f_x.get_probs()
+
+        top_indices = torch.argmax(f_x_probs, dim=-1)
+        row_indices = torch.arange(f_x_probs.size(0), device=f_x_probs.device)
+
+        y_true_top = y_true_probs[row_indices, top_indices]
+        y_pred_top = y_pred_probs[row_indices, top_indices].unsqueeze(-1)
+        f_x_top = f_x_probs[row_indices, top_indices].unsqueeze(-1)
+    
+        y_pred_top = torch.cat([1 - y_pred_top, y_pred_top], dim=1)
+        f_x_top = torch.cat([1 - f_x_top, f_x_top],  dim=1)
+
+        return CategoricalDirac(torch.as_tensor(y_true_top).long(), n_classes=2), CategoricalProbs(y_pred_top), CategoricalProbs(f_x_top)
+
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
+        """
+        Isolates the top class distributions, updates kwargs, and defers to base metric.
+        """
+        f_x = kwargs.get("f_x", y_pred)  # use predictions for choosing the top class if f_x is not provided
+
+        y_true_top, y_pred_top, f_x_top = self._extract_top_class(y_true, y_pred, f_x)
+        
+        updated_kwargs = kwargs.copy()
+        updated_kwargs["f_x"] = f_x_top
+        
+        return self.base_metric._compute_indiv(y_true=y_true_top, y_pred=y_pred_top, **updated_kwargs)
+
+
+class ConfidenceLoss(ClassificationMetric):
+    def __init__(self, metric: Metrics, direction: str):
+        """
+        Wrapper to calculate under- and over-confidence for a single metric.
+        
+        :param metric: An instantiated single Metric object.
+        :param direction: 'over' or 'under'
+        """
+        if isinstance(metric, str):
+            raise TypeError("Expected a metric object, got a string. Use ConfidenceWrapper.from_name() to initialize from a string.")
+        
+        if isinstance(metric, list) or metric.__class__.__name__ == 'CombinedMetrics':
+            raise ValueError("ConfidenceWrapper only supports a single metric object. Multiple metrics or CombinedMetrics are not supported.")
+
+        assert direction in ['over', 'under'], "direction must be 'over' or 'under'"
+        
+        self.direction = direction
+        self.base_metric = metric
+
+        base_name = self.base_metric.get_names()[0]
+        is_lower_better = self.base_metric.is_lower_better_list[0]
+        wrapper_name = f"{direction}-{base_name}"
+        super().__init__(name=wrapper_name, is_lower_better=is_lower_better, requires_f_x=True)
+
+    @classmethod
+    def from_name(cls, metric_name: str, direction: str) -> 'ConfidenceLoss':
+        """
+        Initialize the wrapper directly from a metric's string name.
+        """
+        base_metric = cls._resolve_single_metric(metric_name)
+        return cls(metric=base_metric, direction=direction)
+
+    @staticmethod
+    def _resolve_single_metric(name: str) -> Metrics:
+        """Helper to pull the specific base class out of candidates."""
+        return Metrics.from_names([name]).metrics_list[0]
+
+    def _clip_distribution(self, y_pred: CategoricalDistribution, f_x: CategoricalDistribution) -> CategoricalDistribution:
+        """Helper to handle the clipping logic dynamically based on direction."""
+        if self.direction == 'over':
+            clipped_probs = _clip_p_values(y_pred.get_probs(), f_x.get_probs(), for_over=True)
+        elif self.direction == 'under':
+            clipped_probs = _clip_p_values(y_pred.get_probs(), f_x.get_probs(), for_under=True)
+        else:
+            raise ValueError("direction must be 'over' or 'under'")
+            
+        return CategoricalProbs(clipped_probs)
+
+    def _compute_indiv(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
+        """
+        Standard individual computation for single ClassificationMetrics.
+        """
+        f_x = kwargs.get("f_x")
+        assert f_x is not None, f"f_x is required for {self.get_names()[0]}"
+
+        clipped_y_pred = self._clip_distribution(y_pred, f_x)
+        
+        return self.base_metric._compute_indiv(y_true=y_true, y_pred=clipped_y_pred, **kwargs)
+
+
+class OverConfidenceLoss(ConfidenceLoss):
+    def __init__(self, metric: Metrics):
+        """
+        Specialized wrapper for calculating over-confidence for a single metric.
+        
+        :param metric: An instantiated single Metric object.
+        """
+        # We explicitly set direction to 'over'
+        super().__init__(metric=metric, direction='over')
+
+    @classmethod
+    def from_name(cls, metric_name: str) -> 'OverConfidenceLoss':
+        """
+        Initialize the over-confidence wrapper directly from a metric's string name.
+        """
+        return cls(metric=cls._resolve_single_metric(metric_name))
+
+
+class UnderConfidenceLoss(ConfidenceLoss):
+    def __init__(self, metric: Metrics):
+        """
+        Specialized wrapper for calculating under-confidence for a single metric.
+        
+        :param metric: An instantiated single Metric object.
+        """
+        # We explicitly set direction to 'under'
+        super().__init__(metric=metric, direction='under')
+
+    @classmethod
+    def from_name(cls, metric_name: str) -> 'UnderConfidenceLoss':
+        """
+        Initialize the under-confidence wrapper directly from a metric's string name.
+        """
+        return cls(metric=cls._resolve_single_metric(metric_name))
 
 
 class BalancedAccuracy(ClassificationMetric):
@@ -460,7 +769,7 @@ class SklearnClassificationMetric(ClassificationMetric):
         self.uses_probs = uses_probs
         self.two_class_single_column = two_class_single_column
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         # adapted from https://github.com/dholzmueller/pytabkit/blob/39086ac0621918de315c234d4719411705e13ea1/pytabkit/models/training/metrics.py#L518
         # handle classes that don't occur in the test set
         y_probs = y_pred.get_probs()
@@ -480,7 +789,6 @@ class SklearnClassificationMetric(ClassificationMetric):
 
         y_np = y.cpu().numpy()
         return torch.as_tensor(self.sklearn_func(y_np, y_pred_np))
-
 
 class AUROCOneVsRestSklearn(SklearnClassificationMetric):
     def __init__(self):
@@ -507,7 +815,7 @@ class TorchmetricsClassificationMetric(ClassificationMetric):
         # can be overridden instead of specifying torch_metric in the constructor if more control is needed
         return self.torch_metric(task='binary' if n_classes == 2 else 'multiclass', num_classes=n_classes)
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         import torchmetrics
         y_probs = y_pred.get_probs()
         y = y_true.get_modes()
@@ -546,7 +854,7 @@ class OneMinusAUROCOneVsRest(ClassificationMetric):
             return 1. - other_metric_values['auroc_ovr']
         return None
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         return 1. - AUROCOneVsRest().compute(y_true=y_true, y_pred=y_pred)
 
 
@@ -575,7 +883,7 @@ class SmoothCalibrationError(ClassificationMetric):
     def __init__(self):
         super().__init__(name='smece', is_lower_better=True)
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         import relplot as rp
 
         labels_torch = y_true.get_modes()
@@ -609,7 +917,7 @@ class MetricsWithCalibration(Metrics):
 
     def compute_all(self, y_true: Distribution, y_pred: Distribution,
                     other_metric_values: Optional[Dict[str, torch.Tensor]] = None, reduction: str = 'mean',
-                    weights: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                    weights: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, torch.Tensor]:
         assert isinstance(y_true, CategoricalDistribution)
         assert isinstance(y_pred, CategoricalDistribution)
 
@@ -619,11 +927,23 @@ class MetricsWithCalibration(Metrics):
         cal_probs = []
         true_probs = []
 
+        # is_binary = y_pred.get_probs().shape[-1] == 1
+
         for train_idxs, val_idxs in splits:
             cal: Calibrator = sklearn.base.clone(self.calibrator)
-            cal.fit_torch(CategoricalProbs(y_pred.get_probs()[train_idxs]), y_true.get_modes()[train_idxs])
-            y_val_probs = cal.predict_proba_torch(CategoricalProbs(y_pred.get_probs()[val_idxs])).get_probs()
+            if isinstance(cal, Calibrator):
+                cal.fit_torch(CategoricalProbs(y_pred.get_probs()[train_idxs]), y_true.get_modes()[train_idxs])
+                y_val_probs = cal.predict_proba_torch(CategoricalProbs(y_pred.get_probs()[val_idxs])).get_probs()
+            else: 
+                cal.fit( y_pred.get_probs().detach().cpu().numpy()[train_idxs], y_true.get_modes().detach().cpu().numpy()[train_idxs])
+                y_val_probs = torch.tensor( cal.predict_proba( y_pred.get_probs().detach().cpu().numpy()[val_idxs] ) )
 
+            # todo: fix this
+            # if is_binary:
+            #     orig_probs.append(y_pred.get_probs()[val_idxs])
+            #     cal_probs.append(y_val_probs[:, [1]])
+            #     true_probs.append(y_true.get_modes()[val_idxs].reshape(-1, 1)) 
+            # else:
             orig_probs.append(y_pred.get_probs()[val_idxs])
             cal_probs.append(y_val_probs)
             true_probs.append(y_true.get_probs()[val_idxs])
@@ -632,9 +952,10 @@ class MetricsWithCalibration(Metrics):
         y_pred_cal_dist = CategoricalProbs(torch.cat(cal_probs, dim=-2))
         y_true_dist = CategoricalProbs(torch.cat(true_probs, dim=-2))
 
-        orig_results = self.metrics.compute_all(y_true=y_true_dist, y_pred=y_pred_orig_dist,
+        orig_results = self.metrics.compute_all(y_true=y_true_dist, y_pred=y_pred_orig_dist, f_x=y_pred_orig_dist,
                                                 other_metric_values=other_metric_values)
-        ref_results = self.metrics.compute_all(y_true=y_true_dist, y_pred=y_pred_cal_dist)
+        ref_results = self.metrics.compute_all(y_true=y_true_dist, y_pred=y_pred_cal_dist, f_x=y_pred_orig_dist)
+    
         calerr_results = {f'calib-err_{key}{self.name_suffix}': orig_results[key] - ref_results[key] for key in
                           orig_results}
         ref_results = {f'refinement_{key}{self.name_suffix}': value for key, value in ref_results.items()}
@@ -660,7 +981,7 @@ class MeanProbNormalizedMetric(ClassificationMetric):
         else:
             return None
 
-    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution) -> Optional[torch.Tensor]:
+    def _compute_mean(self, y_true: CategoricalDistribution, y_pred: CategoricalDistribution, **kwargs) -> Optional[torch.Tensor]:
         unnorm_value = self.metric.compute(y_true, y_pred)
         ref_value = self.metric.compute(y_true, CategoricalProbs(
             y_pred.get_probs().mean(dim=0, keepdim=True).expand(y_pred.get_n_samples(), -1)))
