@@ -25,15 +25,14 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "torch>=2.0",
     "numpy>=1.25",
     "scikit-learn>=1.3",
     # older versions of torchmetrics (<1.2.1) have a bug that makes certain metrics slow:
     # https://github.com/Lightning-AI/torchmetrics/pull/2184
     "torchmetrics>=1.2.1",
-    "numba<0.61; python_version < '3.10'",
-    "numba>=0.61; python_version >= '3.10'",
-    "torch>=2.0,<2.10; python_version < '3.10'",
-    "torch>=2.0; python_version >= '3.10'",
+    # added constraint due to some pytabkit failure case with github actions, needed for python >= 3.10 anyway
+    "numba>=0.59.0",
 ]
 
 [project.optional-dependencies]
@@ -53,13 +52,13 @@ dev = [
     "matplotlib>=3.0", # plotting
     "fire", # running scripts
     # documentation
-    "sphinx>=7.0",
-    "myst_parser>=3.0",
-    "sphinx_rtd_theme>=2.0",
+    # "sphinx>=7.0",
+    # "myst_parser>=3.0",
+    # "sphinx_rtd_theme>=2.0",
     # testing
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "scipy",  # used only for testing
+    "scipy",
 ]
 dirichletcal = [# requires python >= 3.12
     "dirichletcal", # dirichlet calibration
@@ -76,11 +75,11 @@ features = ["extra", "dev"]
 installer = "uv"
 features = ["extra", "dev"]
 
-[tool.hatch.envs.test.scripts]
-run-tests = "pytest {args}"
-
 [[tool.hatch.envs.test.matrix]]
 python = ["3.9", "3.10", "3.11", "3.12"]
+
+[tool.hatch.envs.test.scripts]
+run-tests = "pytest {args}"
 
 [tool.hatch.build.targets.sdist]
 package = ['probmetrics']

@@ -3,6 +3,7 @@
 *.zip
 *.DS_Store
 *__pycache__
+uv.lock
 
 
 experiments/*/
@@ -23,3 +24,5 @@ rtdl_checkpoints
 examples/.ipynb_checkpoints
 
 scripts/custom_paths.py
+
+env/

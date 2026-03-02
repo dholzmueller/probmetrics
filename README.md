@@ -39,7 +39,7 @@ To obtain all functionality, install `probmetrics[extra,dev,dirichletcal]`.
   Venn-Abers calibration, 
   centered isotonic regression, 
   and the temperature scaling implementation in NetCal.
-- dev installs more packages for development (esp. documentation)
+- dev installs more packages for development (esp. testing)
 - dirichletcal installs Dirichlet calibration, 
   which however only works for Python 3.12 upwards.
 
@@ -237,7 +237,8 @@ metrics = MetricsWithCalibration(loss,
                             val_splitter=CVSplitter(n_cv=5) # cross-validation splitter
                             )
 
-# or use combined metrics
+# or use combined metrics to evaluate multiple metrics 
+# while fitting the post-hoc calibrator only once
 combined_losses = CombinedMetrics( 
                                     [
                                     ProperLpLoss(p=1), 
@@ -261,34 +262,42 @@ results = metrics.compute_all_from_labels_probs(y_true, y_prob)
 
 The `calibrator` argument is a class used to recalibrate the original predictions. 
 Any estimator that inherits from sklearn.base.ClassifierMixin (i.e., follows the 
-scikit-learn classifier API) can be used.
+scikit-learn classifier API) and implements `predict_proba()` can be used.
 We recommend using `WS_CatboostClassifier` with default parameters. 
 The "WS" stands for "Warm Start", as predictions are initialized at the 
-original predicted $f(x)$ values, (see the paper A Variational Estimator for Lp 
-Calibration Errors for additional information). 
+original predicted $f(x)$ values (see the paper [A Variational Estimator for Lp 
+Calibration Errors](https://arxiv.org/abs/2602.24230) for additional information). 
 
 
 ### Binary vs. multiclass formatting
 
-The library expects predictions in a multiclass format with shape `(n_samples, n_classes)`.
-For binary classification, you can control whether to treat the output as a two-column distribution 
+The library internally stores predictions in a multiclass format 
+with shape `(n_samples, n_classes)`.
+For binary classification, for some metrics 
+you can control whether to treat the output as a two-column distribution 
 or a single-column probability using the `binary_as_multiclass` parameter.
+For example, for `BrierLoss()`, using `binary_as_multiclass=False` 
+will yield the scikit-learn formula, while `binary_as_multiclass=True` 
+will yield twice the value.
 
 Setting `binary_as_multiclass=False` tells the loss function to treat 
 `(n_samples, 2)` predictions as a single-column `(n_samples, 1)` probability.
- It automatically transforms binary labels $Y \in {0, 1}$ and the probability
-  column $f(X) \in [0, 1]$ for the calculation.
+The loss then internally transforms the data to 
+binary labels $Y \in {0, 1}$ and the probability
+column $f(X) \in [0, 1]$ for the calculation.
 
 Those features are also valid with the `TopClassLoss`.
 The `TopClassLoss` wrapper focuses the loss calculation on the class with 
 the highest predicted probability. The behavior changes based on your binary setting,
 for instance:
 
-| Configuration                                                  | Estimate | Description |
-|:---------------------------------------------------------------| :--- | :--- |
-| `TopClassLoss( ProperLpLoss(p=1) )`                            | $\mathbb{E}[ \lvert Z - \mathbb{E}[Z \mid topf(X)] \rvert ]$ | Scalar probability: $topf(X)$ is the scalar probability of the top class of $f(X)$; $Z \in \{0, 1\}$ equals $1$ if the label is what the top-class predicted and $0$ otherwise. Evaluates the absolute error of the top-class prediction. |
-| `TopClassLoss( ProperLpLoss(p=1, binary_as_multiclass=True) )` | $\mathbb{E}[ \Vert \mathbf{Z} - \mathbb{E}[\mathbf{Z} \mid topf(X)] \Vert_1 ]$ | Vectorized: $\mathbf{Z}$ is a one-hot vector. Calculates the $L_1$ norm of the error vector. |
+| Configuration                                                | Estimate                                                                         | Description                                                                                                                                                                                                                                 |
+|:-------------------------------------------------------------|:---------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `TopClassLoss(ProperLpLoss(p=1))`                            | $\mathbb{E}[ \lvert Z - \mathbb{E}[Z \mid \max f(X)] \rvert ]$                   | Scalar probability: $\max f(X)$ is the scalar probability of the top class of $f(X)$; $Z \in \{0, 1\}$ equals $1$ if the label is what the top-class predicted and $0$ otherwise. Evaluates the absolute error of the top-class prediction. |
+| `TopClassLoss(ProperLpLoss(p=1, binary_as_multiclass=True))` | $\mathbb{E}[ \Vert \mathbf{Z} - \mathbb{E}[\mathbf{Z} \mid \max f(X)] \Vert_1 ]$ | Vectorized: $\mathbf{Z}$ is a one-hot vector. Calculates the $L_1$ norm of the error vector.                                                                                                                                                |
 
+When used inside `MetricsWithCalibration`, `TopClassLoss` will choose the top-class 
+based on $f(X)$ instead of $g(f(X))$ so the loss difference uses the same choice of top class for both terms.
 
 ## Contributors
 - David Holzmüller
@@ -303,6 +312,7 @@ for instance:
   - TopClassLoss: A wrapper to variationally evaluate top-class errors.
   - OverConfidenceLoss & UnderConfidenceLoss: Wrappers to variationally evaluate 
     over/under-confidence in binary predictors.
+  - MetricsWithCalibration can now handle arbitrary classifiers and Lp-type losses.
   - New classifiers:  Added `WS_CatboostClassifier` and `WS_LGBMClassifier` for 
     evaluating calibration errors.
   - removed sklearn < 1.7 constraint.
