@@ -76,6 +76,9 @@ features = ["extra", "dev"]
 installer = "uv"
 features = ["extra", "dev"]
 
+[[tool.hatch.envs.hatch-test.matrix]]
+python = ["3.12", "3.11", "3.10", "3.9"]
+
 [tool.hatch.build.targets.sdist]
 package = ['probmetrics']
 only-include = ['probmetrics']
